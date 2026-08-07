@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(docker compose up -d)",
+      "PowerShell(python -m venv .venv)",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\pip.exe install -r requirements.txt 2>&1)",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -m pytest -q)",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\ruff.exe check .)",
+      "PowerShell(Get-Process \"Docker Desktop\" -ErrorAction SilentlyContinue)",
+      "PowerShell(docker version 2>&1)",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\alembic.exe upgrade head)"
+    ]
+  }
+}
