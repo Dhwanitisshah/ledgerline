@@ -5,13 +5,14 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from alembic import context
 from app.config import settings
+from app.models import Base
 
 config = context.config
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-target_metadata = None
+target_metadata = Base.metadata
 
 
 def get_url() -> str:

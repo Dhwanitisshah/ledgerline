@@ -7,6 +7,28 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+
+    # Phase 1 tests exercise real Postgres behaviour -- CHECK constraints, the
+    # append-only triggers, transactional rollback -- so CI needs a real database.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ledgerline
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d ledgerline"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Note the port: 5432 here (the service mapping), 5433 locally (compose).
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/ledgerline
+
     steps:
       - uses: actions/checkout@v4
 
@@ -16,6 +38,22 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      - name: Wait for Postgres
+        run: |
+          for i in $(seq 1 30); do
+            if pg_isready -h localhost -p 5432 -U postgres -d ledgerline; then
+              echo "postgres is ready"
+              exit 0
+            fi
+            echo "waiting for postgres ($i/30)..."
+            sleep 2
+          done
+          echo "postgres did not become ready in time" >&2
+          exit 1
+
+      - name: Migrate
+        run: alembic upgrade head
 
       - name: Lint
         run: ruff check .

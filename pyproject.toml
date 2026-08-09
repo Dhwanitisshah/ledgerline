@@ -4,3 +4,10 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
+
+[tool.pytest.ini_options]
+# Every ledger test is async and talks to a real Postgres; auto mode saves an
+# @pytest.mark.asyncio on each one.
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
