@@ -1,12 +1,13 @@
 """The money rules, expressed as explicit SQL.
 
-Two things live here, and both are written as raw SQL rather than ORM queries so
-that the database behaviour is visible on the page instead of buried in a query
-builder:
+These are written as raw SQL rather than ORM queries so that the database
+behaviour is visible on the page instead of buried in a query builder:
 
 1. :func:`account_balance` -- the derived balance. There is no balance column.
 2. :func:`transaction_totals` -- the sum-to-zero invariant check, run against the
    rows actually flushed to the database, before commit.
+3. :func:`transaction_currencies` -- the single-currency invariant check, likewise
+   read back from the flushed rows.
 
 Balance convention (used everywhere, no exceptions)::
 
@@ -56,6 +57,18 @@ _TOTALS_SQL = text(
     """
 )
 
+# The distinct currencies a posting touches, resolved through the accounts its
+# entries reference. More than one means the posting cannot be summed at all.
+_CURRENCIES_SQL = text(
+    """
+    SELECT DISTINCT accounts.currency AS currency
+    FROM ledger_entries
+    JOIN accounts ON accounts.id = ledger_entries.account_id
+    WHERE ledger_entries.transaction_id = :transaction_id
+    ORDER BY currency
+    """
+)
+
 
 class TransactionTotals(NamedTuple):
     """Debit and credit totals for a single ledger transaction, in minor units."""
@@ -94,3 +107,18 @@ async def transaction_totals(session: AsyncSession, transaction_id: uuid.UUID) -
     """
     row = (await session.execute(_TOTALS_SQL, {"transaction_id": transaction_id})).one()
     return TransactionTotals(debits=int(row.debits), credits=int(row.credits))
+
+
+async def transaction_currencies(session: AsyncSession, transaction_id: uuid.UUID) -> list[str]:
+    """Return the distinct account currencies a posting touches, sorted.
+
+    Like :func:`transaction_totals`, this resolves currencies from the database
+    rather than trusting the request: the caller never states a currency, so the
+    only honest source is the ``accounts`` rows the entries actually point at.
+
+    A posting spanning more than one currency is not a posting that happens to be
+    unbalanced -- it is one whose totals cannot be compared at all, since 100 paise
+    and 100 cents are different units wearing the same integer.
+    """
+    rows = await session.execute(_CURRENCIES_SQL, {"transaction_id": transaction_id})
+    return [row.currency for row in rows]

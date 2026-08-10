@@ -1,4 +1,4 @@
-# Phase 1 smoke test. Requires the app running on http://localhost:8000
+# Phase 1 smoke test. Requires the app running on $BaseUrl
 # (see the README for the ordered startup commands).
 #
 # Bodies are written to temp files and passed with --data-binary "@file" rather
@@ -6,9 +6,13 @@
 # mangled differently by Windows PowerShell 5.1 and PowerShell 7. Files sidestep
 # the whole problem.
 
+param(
+    [string]$BaseUrl = "http://localhost:8000"
+)
+
 $ErrorActionPreference = "Stop"
 
-$Base = "http://localhost:8000"
+$Base = $BaseUrl.TrimEnd("/")
 $TmpDir = Join-Path $env:TEMP "ledgerline-smoke"
 New-Item -ItemType Directory -Force -Path $TmpDir | Out-Null
 
@@ -125,5 +129,31 @@ $payerAfter = Invoke-Api -Method GET -Path "/accounts/$payerId/balance"
 $payeeAfter = Invoke-Api -Method GET -Path "/accounts/$payeeId/balance"
 Assert-Equal -Expected (-250000) -Actual $payerAfter.Body.balance -What "payer balance unchanged after rollback"
 Assert-Equal -Expected 250000 -Actual $payeeAfter.Body.balance -What "payee balance unchanged after rollback"
+
+Write-Host "`n=== 6. Fire a mixed-currency posting -- expect 422 ===" -ForegroundColor Cyan
+
+$usd = Invoke-Api -Method POST -Path "/accounts" -Body '{"name":"Dollar account","currency":"USD"}'
+Assert-Equal -Expected 201 -Actual $usd.Status -What "POST /accounts (USD) status"
+$usdId = $usd.Body.id
+
+# Equal integers, different units: 100 paise is not 100 cents.
+$mixedBody = @"
+{
+  "description": "smoke: paise against cents",
+  "entries": [
+    {"account_id": "$payerId", "direction": "debit",  "amount": 100},
+    {"account_id": "$usdId",   "direction": "credit", "amount": 100}
+  ]
+}
+"@
+
+$mixed = Invoke-Api -Method POST -Path "/transactions" -Body $mixedBody
+Assert-Equal -Expected 422 -Actual $mixed.Status -What "POST /transactions (mixed currency) status"
+Write-Host "  detail: $($mixed.Body.detail)"
+
+$payerFinal = Invoke-Api -Method GET -Path "/accounts/$payerId/balance"
+$usdFinal = Invoke-Api -Method GET -Path "/accounts/$usdId/balance"
+Assert-Equal -Expected (-250000) -Actual $payerFinal.Body.balance -What "payer balance unchanged"
+Assert-Equal -Expected 0 -Actual $usdFinal.Body.balance -What "USD account never touched"
 
 Write-Host "`nPhase 1 smoke: all checks passed.`n" -ForegroundColor Green

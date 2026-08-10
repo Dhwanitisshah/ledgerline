@@ -85,6 +85,101 @@ async def test_unbalanced_posting_is_rejected_and_writes_zero_rows(client: Async
     assert await get_balance(client, payee) == 0
 
 
+async def test_mixed_currency_posting_is_rejected_and_writes_zero_rows(
+    client: AsyncClient,
+) -> None:
+    """100 paise must not appear to offset 100 cents just because both are 100."""
+    rupees = await create_account(client, "Rupee account", currency="INR")
+    dollars = await create_account(client, "Dollar account", currency="USD")
+
+    response = await client.post(
+        "/transactions",
+        json={
+            "description": "paise against cents",
+            "entries": [
+                {"account_id": rupees, "direction": "debit", "amount": 100},
+                {"account_id": dollars, "direction": "credit", "amount": 100},
+            ],
+        },
+    )
+    assert response.status_code == 422, response.text
+    detail = response.json()["detail"]
+    assert "mixed-currency" in detail
+    assert "INR" in detail and "USD" in detail
+
+    assert await count_rows("ledger_transactions") == 0
+    assert await count_rows("ledger_entries") == 0
+    assert await get_balance(client, rupees) == 0
+    assert await get_balance(client, dollars) == 0
+
+
+async def test_mixed_currency_is_rejected_even_when_amounts_sum_to_zero(
+    client: AsyncClient,
+) -> None:
+    """The currency check runs first, so this fails on currency, not on balance."""
+    rupees = await create_account(client, "Rupee account", currency="INR")
+    dollars_a = await create_account(client, "Dollar account A", currency="USD")
+    dollars_b = await create_account(client, "Dollar account B", currency="USD")
+
+    response = await client.post(
+        "/transactions",
+        json={
+            "description": "sums to zero, still nonsense",
+            "entries": [
+                {"account_id": rupees, "direction": "debit", "amount": 500},
+                {"account_id": dollars_a, "direction": "credit", "amount": 300},
+                {"account_id": dollars_b, "direction": "credit", "amount": 200},
+            ],
+        },
+    )
+    assert response.status_code == 422, response.text
+    assert "mixed-currency" in response.json()["detail"]
+    assert await count_rows("ledger_entries") == 0
+
+
+async def test_same_currency_posting_still_succeeds_for_non_default_currency(
+    client: AsyncClient,
+) -> None:
+    """The single-currency rule constrains postings; it does not force INR."""
+    payer = await create_account(client, "Payer", currency="USD")
+    payee = await create_account(client, "Payee", currency="USD")
+
+    response = await client.post(
+        "/transactions",
+        json={
+            "description": "USD transfer",
+            "entries": [
+                {"account_id": payer, "direction": "debit", "amount": 12500},
+                {"account_id": payee, "direction": "credit", "amount": 12500},
+            ],
+        },
+    )
+    assert response.status_code == 201, response.text
+
+    assert await get_balance(client, payer) == -12500
+    assert await get_balance(client, payee) == 12500
+
+
+async def test_single_account_posting_is_not_treated_as_mixed_currency(
+    client: AsyncClient,
+) -> None:
+    """One account, two legs: a single currency, so only the sum check applies."""
+    account = await create_account(client, "Solo", currency="INR")
+
+    response = await client.post(
+        "/transactions",
+        json={
+            "description": "debit and credit the same account",
+            "entries": [
+                {"account_id": account, "direction": "debit", "amount": 700},
+                {"account_id": account, "direction": "credit", "amount": 700},
+            ],
+        },
+    )
+    assert response.status_code == 201, response.text
+    assert await get_balance(client, account) == 0
+
+
 async def test_single_sided_posting_is_rejected(client: AsyncClient) -> None:
     account = await create_account(client, "Lonely")
 

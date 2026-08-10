@@ -128,6 +128,12 @@ Because the check runs before `COMMIT`, a rejected posting leaves nothing behind
 no orphaned transaction row, no half-written entry. Empty postings are rejected at
 the schema, and single-sided postings fail the sum check with a distinct message.
 
+**All entries in one transaction must also share a single currency**, resolved
+from the `accounts` rows the entries point at — checked *before* the sum, because
+summing 100 paise against 100 cents is meaningless arithmetic rather than a near
+miss. A mixed-currency posting rolls back with a 422. This is the whole rule:
+there is no FX, no conversion, and no currency column on transactions.
+
 ### Endpoints
 
 | Method | Path                        | Behaviour                                                   |
@@ -136,8 +142,8 @@ the schema, and single-sided postings fail the sum check with a distinct message
 | `GET`  | `/accounts/{id}/balance`    | `{account_id, currency, balance}` derived by SQL SUM; 404 if unknown |
 | `POST` | `/transactions`             | Posts a balanced entry set atomically; 422 if unbalanced     |
 
-Balances are in minor units. `POST /transactions` also returns 422 for an entry
-referencing an account that does not exist.
+Balances are in minor units. `POST /transactions` also returns 422 for a posting
+that mixes currencies, or for an entry referencing an account that does not exist.
 
 ### Not in Phase 1 (on purpose)
 
