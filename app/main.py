@@ -1,11 +1,12 @@
 from fastapi import FastAPI
 
-from app.routers import accounts, transactions
+from app.routers import accounts, charges, transactions
 
 app = FastAPI(title="Ledgerline")
 
 app.include_router(accounts.router)
 app.include_router(transactions.router)
+app.include_router(charges.router)
 
 
 @app.get("/health")

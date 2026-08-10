@@ -34,7 +34,9 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          # Pinned to match the local venv exactly. The version lives here and in
+          # ruff's target-version in pyproject.toml, and nowhere else.
+          python-version: "3.13"
 
       - name: Install dependencies
         run: pip install -r requirements.txt

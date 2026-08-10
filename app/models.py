@@ -31,11 +31,35 @@ class EntryDirection(StrEnum):
     CREDIT = "credit"
 
 
-# The Postgres enum stores the lowercase *values* ('debit'/'credit'), not the
-# Python member names, so the DB is readable without knowing the Python enum.
+class PaymentStatus(StrEnum):
+    """Where a payment sits in its lifecycle.
+
+    ``REFUNDED`` is defined but unreachable: the legal-transition table in
+    ``app/payments.py`` has no move into it, and no endpoint produces one. It
+    exists here because the Postgres enum type has to carry every value the
+    column will ever hold, and widening an enum later is a migration this project
+    would rather write once. Phase 6 owns the refund flow.
+    """
+
+    CREATED = "created"
+    PROCESSING = "processing"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    REFUNDED = "refunded"
+
+
+# Both Postgres enums store the lowercase *values* ('debit'/'credit',
+# 'created'/'processing'/...), not the Python member names, so the database is
+# readable without knowing the Python enum.
 entry_direction_enum = sa.Enum(
     EntryDirection,
     name="entry_direction",
+    values_callable=lambda enum_cls: [member.value for member in enum_cls],
+)
+
+payment_status_enum = sa.Enum(
+    PaymentStatus,
+    name="payment_status",
     values_callable=lambda enum_cls: [member.value for member in enum_cls],
 )
 
@@ -126,12 +150,23 @@ class LedgerEntry(Base):
 
 
 class Payment(Base):
-    """Placeholder so the schema is complete. Phase 2 owns the payment lifecycle.
+    """One charge attempt and where it got to. Phase 2 gives this table its life.
 
-    Deliberately empty of behaviour: no status machine, no processor reference, no
-    idempotency key, no transitions. Nothing in Phase 1 reads or writes this table.
-    Do not add payment logic here -- it belongs to Phase 2 (the charge flow) and
-    Phase 3 (idempotency).
+    Unlike the ledger tables, ``payments`` is **mutable on purpose**. A payment
+    moves ``created -> processing -> succeeded|failed``, and those moves are
+    UPDATEs. Only the money is append-only; the record of what a processor said
+    about a charge is a status that legitimately changes. Every change goes
+    through ``app.payments.transition``, which is the only sanctioned writer of
+    this column.
+
+    ``ledger_transaction_id`` is the join between the lifecycle and the money, and
+    migration ``0003`` puts a CHECK constraint across it: a ``succeeded`` payment
+    must point at a posting, and a payment in any other state must not. That is
+    the atomicity guarantee of this phase written down where the database can
+    enforce it rather than left to the route to remember.
+
+    Still absent, on purpose: an idempotency key (Phase 3), any locking or version
+    column (Phase 4), and any outbox linkage (Phase 5).
     """
 
     __tablename__ = "payments"
@@ -143,12 +178,40 @@ class Payment(Base):
         server_default=sa.text("gen_random_uuid()"),
     )
     account_id: Mapped[uuid.UUID] = mapped_column(
-        sa.Uuid, sa.ForeignKey("accounts.id"), nullable=False
+        sa.Uuid, sa.ForeignKey("accounts.id"), nullable=False, index=True
     )
+    # BIGINT minor units, same rule as the ledger. Never a float, never a Decimal.
     amount: Mapped[int] = mapped_column(sa.BigInteger, nullable=False)
-    status: Mapped[str] = mapped_column(
-        sa.Text, nullable=False, server_default=sa.text("'created'")
+    currency: Mapped[str] = mapped_column(
+        sa.CHAR(3), nullable=False, server_default=sa.text("'INR'")
+    )
+    status: Mapped[PaymentStatus] = mapped_column(
+        payment_status_enum,
+        nullable=False,
+        default=PaymentStatus.CREATED,
+        server_default=sa.text("'created'"),
+    )
+    # The processor's handle on this attempt. Set for failures too -- a declined
+    # charge has a reference, and it is what you quote when someone asks why.
+    processor_ref: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    failure_reason: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    # NULL until (and unless) the charge succeeds and its postings are written.
+    ledger_transaction_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid, sa.ForeignKey("ledger_transactions.id"), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(
         sa.TIMESTAMP(timezone=True), nullable=False, server_default=sa.text("now()")
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        sa.TIMESTAMP(timezone=True), nullable=False, server_default=sa.text("now()")
+    )
+
+    __table_args__ = (
+        sa.CheckConstraint("amount > 0", name="ck_payments_amount_positive"),
+        # Exactly the succeeded payments have a posting. See migration 0003 for
+        # why this lives in the database rather than in the route.
+        sa.CheckConstraint(
+            "(status = 'succeeded') = (ledger_transaction_id IS NOT NULL)",
+            name="ck_payments_posting_matches_status",
+        ),
     )

@@ -29,6 +29,8 @@ from typing import NamedTuple
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models import EntryDirection, LedgerEntry, LedgerTransaction
+
 # Derived balance for one account: credits positive, debits negative.
 _BALANCE_SQL = text(
     """
@@ -122,3 +124,126 @@ async def transaction_currencies(session: AsyncSession, transaction_id: uuid.UUI
     """
     rows = await session.execute(_CURRENCIES_SQL, {"transaction_id": transaction_id})
     return [row.currency for row in rows]
+
+
+# --- Phase 2: the posting a successful charge writes ---------------------------
+
+
+class LedgerInvariantError(RuntimeError):
+    """A posting *this service* built has failed the ledger invariants.
+
+    Distinct from the 422 that ``POST /transactions`` returns for a caller's
+    unbalanced request. That is bad input; this is a bug -- Ledgerline itself
+    constructed a posting that does not balance or spans two currencies. It is
+    raised rather than returned so the charge flow cannot shrug and commit it: the
+    only correct response to "the money I just built is wrong" is to abandon the
+    whole transaction.
+    """
+
+
+# Every account whose name starts with this prefix is a house account rather than
+# a customer's. Migration 0003 puts a partial UNIQUE index over exactly this
+# prefix, so there can never be two settlement accounts for one currency.
+SETTLEMENT_ACCOUNT_PREFIX = "house:"
+
+
+def settlement_account_name(currency: str) -> str:
+    """The well-known name of the house account that funds charges in ``currency``."""
+    return f"{SETTLEMENT_ACCOUNT_PREFIX}card_settlement:{currency}"
+
+
+# Get-or-create in one statement. ON CONFLICT here is not concurrency control in
+# the Phase 4 sense -- no lock is taken and there is no retry loop; it is a UNIQUE
+# index doing the one job a UNIQUE index exists to do. Written as
+# SELECT-then-INSERT instead, this would leave a window where two charges each
+# create their own settlement account and the house balance silently splits in two.
+_UPSERT_SETTLEMENT_SQL = text(
+    """
+    INSERT INTO accounts (name, currency)
+    VALUES (:name, :currency)
+    ON CONFLICT (name) WHERE name LIKE 'house:%'
+    DO NOTHING
+    """
+)
+
+_SELECT_SETTLEMENT_SQL = text("SELECT id FROM accounts WHERE name = :name")
+
+
+async def settlement_account_id(session: AsyncSession, currency: str) -> uuid.UUID:
+    """Return the house settlement account for ``currency``, creating it if needed.
+
+    A charge is money entering Ledgerline from outside it, and double-entry has no
+    way to write "from outside" -- every leg needs an account. The house account is
+    that counterparty: it is debited by exactly as much as customer accounts are
+    credited, so its balance is the negative of everything ever funded in that
+    currency, and the ledger as a whole still sums to zero.
+
+    One per currency, because a posting may not mix currencies.
+    """
+    name = settlement_account_name(currency)
+    await session.execute(_UPSERT_SETTLEMENT_SQL, {"name": name, "currency": currency})
+    row = (await session.execute(_SELECT_SETTLEMENT_SQL, {"name": name})).one()
+    return row.id
+
+
+async def write_charge_posting(
+    session: AsyncSession,
+    *,
+    description: str,
+    debit_account_id: uuid.UUID,
+    credit_account_id: uuid.UUID,
+    amount: int,
+) -> LedgerTransaction:
+    """Write the two-legged posting for a successful charge, and prove it balances.
+
+    Called only after the processor has said yes. Nothing writes a ledger row on
+    speculation, which is what makes the failure path trivially safe: there is no
+    partial posting to clean up because there was never a partial posting.
+
+    The invariants are re-checked here even though this function builds both legs
+    itself and they balance by construction. That is deliberate: "balanced by
+    construction" is a property of the code as written today, and the check costs
+    one round trip against rows already sitting in the transaction. If a later edit
+    breaks the construction, this raises instead of committing a broken ledger. The
+    invariants are the Phase 1 ones, unchanged and reused.
+
+    Raises :class:`LedgerInvariantError` *without* rolling back -- the caller owns
+    the transaction and decides what to abandon.
+    """
+    transaction = LedgerTransaction(description=description)
+    session.add(transaction)
+    session.add_all(
+        [
+            LedgerEntry(
+                transaction=transaction,
+                account_id=debit_account_id,
+                direction=EntryDirection.DEBIT,
+                amount=amount,
+            ),
+            LedgerEntry(
+                transaction=transaction,
+                account_id=credit_account_id,
+                direction=EntryDirection.CREDIT,
+                amount=amount,
+            ),
+        ]
+    )
+
+    # Rows are in the transaction but not committed. Make the database prove them.
+    await session.flush()
+
+    currencies = await transaction_currencies(session, transaction.id)
+    if len(currencies) != 1:
+        raise LedgerInvariantError(
+            f"charge posting spans {len(currencies)} currencies "
+            f"({', '.join(currencies) or 'none'}); a posting must be single-currency"
+        )
+
+    totals = await transaction_totals(session, transaction.id)
+    if not totals.is_balanced:
+        raise LedgerInvariantError(
+            f"charge posting does not balance: debits={totals.debits} "
+            f"credits={totals.credits} (minor units)"
+        )
+
+    return transaction

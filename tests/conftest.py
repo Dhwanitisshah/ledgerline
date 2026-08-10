@@ -55,3 +55,30 @@ async def get_balance(client: AsyncClient, account_id: str) -> int:
     response = await client.get(f"/accounts/{account_id}/balance")
     assert response.status_code == 200, response.text
     return response.json()["balance"]
+
+
+async def scalar(sql: str, params: dict | None = None) -> object:
+    """Run a scalar query straight against the database, bypassing the app."""
+    async with engine.connect() as conn:
+        result = await conn.execute(text(sql), params or {})
+        return result.scalar_one()
+
+
+async def create_charge(
+    client: AsyncClient,
+    account_id: str,
+    amount: int,
+    **overrides: object,
+) -> dict:
+    """POST /charges and return the body. Does not assert an outcome.
+
+    ``overrides`` carries the fake-processor knobs (``force_outcome``,
+    ``force_latency_ms``) and anything else the body accepts, so a test can force
+    a decline without touching environment variables.
+    """
+    body: dict[str, object] = {"account_id": account_id, "amount": amount}
+    body.update(overrides)
+
+    response = await client.post("/charges", json=body)
+    assert response.status_code == 201, response.text
+    return response.json()
