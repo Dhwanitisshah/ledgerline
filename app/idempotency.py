@@ -219,3 +219,109 @@ async def finalize_key(
     )
     row = (await session.execute(_READ_BACK_SQL, {"key": key})).one()
     return StoredResponse(body=row.response_snapshot, status_code=row.response_status)
+
+
+# --- Phase 4: the naive claim, preserved so the fix stays falsifiable -----------
+#
+# What follows is deliberately broken code. It is the implementation almost
+# everyone writes first, and it is kept -- runnable, behind
+# IDEMPOTENCY_CLAIM_STRATEGY=naive -- because a fix nobody can watch fail is a fix
+# nobody can check.
+#
+# The shape of the mistake:
+#
+#     1. SELECT the key. Absent? Then this is a new charge.
+#     2. ... charge the card ...
+#     3. INSERT the key, ON CONFLICT DO NOTHING.
+#
+# Step 1 and step 3 are separated by an entire processor call, and step 1's answer
+# is a fact about the past by the time step 3 acts on it. Two simultaneous requests
+# both read "absent" at step 1, so both charge.
+#
+# Step 3 is where it becomes silent rather than loud. Without ON CONFLICT the
+# second INSERT would raise a duplicate-key error, the transaction would roll back,
+# and only one payment would survive -- the primary key would have saved it by
+# accident. ON CONFLICT DO NOTHING is the reasonable-looking line that removes that
+# accident: it was added to stop duplicate-key errors filling the logs, and it
+# works, and the errors stop, and now the system quietly writes two payments
+# against one idempotency key. The logs are clean. The customer is charged twice.
+
+_NAIVE_INSERT_SQL = text(
+    """
+    INSERT INTO idempotency_keys (
+        key, request_hash, response_snapshot, response_status, status, expires_at
+    )
+    VALUES (
+        :key,
+        :request_hash,
+        CAST(:snapshot AS jsonb),
+        :status_code,
+        'completed',
+        now() + (:ttl_seconds * interval '1 second')
+    )
+    ON CONFLICT (key) DO NOTHING
+    """
+)
+
+
+async def claim_key_naive(session: AsyncSession, key: str) -> ExistingClaim | None:
+    """The broken claim: look for a live key, and believe the answer.
+
+    Returns the live claim if one is already recorded (so an ordinary, serial
+    retry still replays correctly -- which is precisely why this passes every test
+    written before Phase 4), or ``None`` meaning "go ahead and charge".
+
+    ``None`` is the lie. It means "no key existed a moment ago", and the caller
+    reads it as "no charge for this key is happening", which is a different claim
+    entirely and is false whenever another request is mid-flight.
+    """
+    row = (
+        await session.execute(
+            text(
+                """
+                SELECT request_hash, status, response_snapshot, response_status
+                FROM idempotency_keys
+                WHERE key = :key AND expires_at > now()
+                """
+            ),
+            {"key": key},
+        )
+    ).first()
+
+    if row is None:
+        return None
+
+    return ExistingClaim(
+        request_hash=row.request_hash,
+        status=row.status,
+        response_snapshot=row.response_snapshot,
+        response_status=row.response_status,
+    )
+
+
+async def finalize_key_naive(
+    session: AsyncSession,
+    key: str,
+    request_hash: str,
+    body: dict[str, Any],
+    status_code: int,
+) -> StoredResponse:
+    """Write the key after the fact, tolerating a key that is somehow already there.
+
+    The tolerance is the bug. See the commentary above.
+    """
+    await session.execute(
+        _NAIVE_INSERT_SQL,
+        {
+            "key": key,
+            "request_hash": request_hash,
+            "snapshot": json.dumps(body, separators=(",", ":")),
+            "status_code": status_code,
+            "ttl_seconds": IDEMPOTENCY_TTL_SECONDS,
+        },
+    )
+    # Returns what this request produced rather than what is stored, because under
+    # a lost race those differ -- and the caller genuinely did perform this charge,
+    # so this is the honest thing to hand back. That two requests can both be
+    # honest about having charged the same card is the whole problem.
+    return StoredResponse(body=body, status_code=status_code)

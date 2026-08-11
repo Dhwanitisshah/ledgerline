@@ -186,7 +186,7 @@ async def settlement_account_id(session: AsyncSession, currency: str) -> uuid.UU
     return row.id
 
 
-async def write_charge_posting(
+async def write_posting(
     session: AsyncSession,
     *,
     description: str,
@@ -194,11 +194,17 @@ async def write_charge_posting(
     credit_account_id: uuid.UUID,
     amount: int,
 ) -> LedgerTransaction:
-    """Write the two-legged posting for a successful charge, and prove it balances.
+    """Write a balanced two-legged posting, and prove it balances.
 
-    Called only after the processor has said yes. Nothing writes a ledger row on
-    speculation, which is what makes the failure path trivially safe: there is no
-    partial posting to clean up because there was never a partial posting.
+    Used by both directions of money movement: a charge debits the house account
+    and credits the customer, a withdrawal does the reverse. The function does not
+    know or care which -- it takes the two accounts and the amount, and enforces
+    the same Phase 1 invariants either way.
+
+    For a charge this is called only after the processor has said yes. Nothing
+    writes a ledger row on speculation, which is what makes the failure path
+    trivially safe: there is no partial posting to clean up because there was never
+    a partial posting.
 
     The invariants are re-checked here even though this function builds both legs
     itself and they balance by construction. That is deliberate: "balanced by
@@ -235,14 +241,14 @@ async def write_charge_posting(
     currencies = await transaction_currencies(session, transaction.id)
     if len(currencies) != 1:
         raise LedgerInvariantError(
-            f"charge posting spans {len(currencies)} currencies "
+            f"posting spans {len(currencies)} currencies "
             f"({', '.join(currencies) or 'none'}); a posting must be single-currency"
         )
 
     totals = await transaction_totals(session, transaction.id)
     if not totals.is_balanced:
         raise LedgerInvariantError(
-            f"charge posting does not balance: debits={totals.debits} "
+            f"posting does not balance: debits={totals.debits} "
             f"credits={totals.credits} (minor units)"
         )
 

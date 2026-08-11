@@ -12,3 +12,9 @@ select = ["E", "F", "I", "UP"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
+markers = [
+    # Tests that reproduce a *deliberately broken* implementation kept in the tree
+    # (see app/strategies.py). They assert the bug still happens, so that the
+    # before/after in the README stays a measurement rather than a memory.
+    "race: exercises a preserved broken concurrency path",
+]

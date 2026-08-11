@@ -90,6 +90,24 @@ class ChargeCreate(BaseModel):
     force_latency_ms: StrictInt | None = Field(default=None, ge=0, le=30_000)
 
 
+class WithdrawalCreate(BaseModel):
+    account_id: uuid.UUID
+    # Minor units, StrictInt for the same reason as everywhere else in this file.
+    amount: StrictInt = Field(gt=0)
+    currency: str | None = Field(default=None, pattern=r"^[A-Z]{3}$")
+
+
+class WithdrawalOut(BaseModel):
+    ledger_transaction_id: uuid.UUID
+    account_id: uuid.UUID
+    amount: int
+    currency: str
+    # The balance this withdrawal left behind. Under the row-lock guard this is
+    # authoritative at the moment of commit; it is returned mainly so a caller (or
+    # a concurrency harness) can see the serialisation actually happening.
+    balance_after: int
+
+
 class ChargeOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

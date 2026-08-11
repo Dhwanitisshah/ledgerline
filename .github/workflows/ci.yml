@@ -8,8 +8,16 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
-    # Phase 1 tests exercise real Postgres behaviour -- CHECK constraints, the
-    # append-only triggers, transactional rollback -- so CI needs a real database.
+    # The suite exercises real Postgres behaviour -- CHECK constraints, the
+    # append-only triggers, transactional rollback, row locks, advisory locks and
+    # ON CONFLICT semantics -- so CI needs a real database. None of it can run
+    # against SQLite or a mock.
+    #
+    # Phase 4's concurrency harness opens up to 60 connections at once (pool_size
+    # 25 + max_overflow 35, see app/db.py). postgres:16 defaults to
+    # max_connections=100, so the stock service configuration has enough headroom;
+    # if the pool is ever widened past ~95, this service needs an explicit
+    # `command: postgres -c max_connections=...`.
     services:
       postgres:
         image: postgres:16

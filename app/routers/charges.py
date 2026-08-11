@@ -72,6 +72,7 @@ commits. Phase 4 owns that, and it is why the claim's 'in_progress' status exist
 but is never observed here.
 """
 
+import asyncio
 import uuid
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
@@ -83,35 +84,90 @@ from app.deps import get_processor, get_session
 from app.idempotency import (
     MAX_KEY_LENGTH,
     claim_key,
+    claim_key_naive,
     finalize_key,
+    finalize_key_naive,
     load_claim,
     request_fingerprint,
 )
-from app.ledger import LedgerInvariantError, settlement_account_id, write_charge_posting
+from app.ledger import LedgerInvariantError, settlement_account_id, write_posting
+from app.locking import try_lock_idempotency_key
 from app.models import Account, Payment, PaymentStatus
 from app.payments import transition
 from app.processor import FakeProcessor, ProcessorAdapter
 from app.schemas import ChargeCreate, ChargeOut
+from app.strategies import ClaimStrategy
 
 router = APIRouter(prefix="/charges", tags=["charges"])
 
 
-async def _complete(session: AsyncSession, key: str, payment: Payment) -> JSONResponse:
+def _replay_or_reject(key: str, existing, request_hash: str) -> JSONResponse:
+    """Turn a claim this request did not win into the right answer.
+
+    Shared by both strategies so that "what a loser gets" is decided in one place
+    and cannot drift between the broken path and the fixed one -- which matters,
+    because the difference between them must be the *locking*, not the semantics.
+    """
+    if existing.request_hash != request_hash:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "idempotency key reused with a different payload: this key is "
+                "already bound to another charge. Use a new key for a new "
+                "charge, or resend the original body to replay its result."
+            ),
+        )
+
+    if not existing.is_completed:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"a charge for idempotency key {key} is still in progress",
+        )
+
+    return JSONResponse(
+        content=existing.response_snapshot, status_code=existing.response_status
+    )
+
+
+async def _widen_the_race_window() -> None:
+    """Hold still, so a race that already exists becomes one you can reproduce.
+
+    Only ever called on the naive path. This does not create the bug: the gap
+    between reading a key and writing it is two statements and a processor call
+    wide at zero milliseconds. It makes that gap reliably observable rather than
+    dependent on how the event loop happened to interleave.
+    """
+    if settings.NAIVE_RACE_WINDOW_MS > 0:
+        await asyncio.sleep(settings.NAIVE_RACE_WINDOW_MS / 1000)
+
+
+async def _complete(
+    session: AsyncSession,
+    key: str,
+    request_hash: str,
+    payment: Payment,
+    strategy: ClaimStrategy,
+) -> JSONResponse:
     """Record the outcome against the idempotency key and commit everything.
 
     Both charge outcomes end here, and both end with a single commit that covers
     the payment, its postings (if any), and the key that now owes this response to
     any retry. The three cannot disagree because they land together.
 
-    The response is built from what ``finalize_key`` read back out of the database,
-    not from the dict that went in, so the first response and every replay are
-    serialised from identical bytes.
+    On the fixed path the response is built from what ``finalize_key`` read back
+    out of the database, not from the dict that went in, so the first response and
+    every replay are serialised from identical bytes.
     """
     await session.flush()
     await session.refresh(payment)
 
     body = ChargeOut.model_validate(payment).model_dump(mode="json")
-    stored = await finalize_key(session, key, body, status.HTTP_201_CREATED)
+    if strategy is ClaimStrategy.NAIVE:
+        stored = await finalize_key_naive(
+            session, key, request_hash, body, status.HTTP_201_CREATED
+        )
+    else:
+        stored = await finalize_key(session, key, body, status.HTTP_201_CREATED)
 
     await session.commit()
     return JSONResponse(content=stored.body, status_code=stored.status_code)
@@ -183,41 +239,49 @@ async def create_charge(
     request_hash = request_fingerprint(
         account_id=payload.account_id, amount=payload.amount, currency=payload.currency
     )
+    strategy = settings.IDEMPOTENCY_CLAIM_STRATEGY
 
-    # The claim is the first thing that touches the database, and it runs in the
-    # same transaction as everything below it. A request that fails anywhere after
-    # this point takes the claim down with it, leaving the key free to retry.
-    if not await claim_key(session, key, request_hash):
-        existing = await load_claim(session, key)
-        if existing is None:  # pragma: no cover - the claim just told us it exists
+    if strategy is ClaimStrategy.NAIVE:
+        # --- The preserved broken path. Not a default; see app/strategies.py. ---
+        existing = await claim_key_naive(session, key)
+        if existing is not None:
+            return _replay_or_reject(key, existing, request_hash)
+        # `None` means "no key a moment ago", which this path then treats as "no
+        # charge is happening". Under concurrency that is false, and the request
+        # walks straight into charging a card another request is already charging.
+        await _widen_the_race_window()
+    else:
+        # --- The shipped path ---------------------------------------------------
+        # Gate on a non-blocking advisory lock *before* the claim. Without it the
+        # ON CONFLICT below is still correct -- Postgres makes the loser wait on the
+        # winner's uncommitted row and it replays afterwards -- but "correct" is
+        # bought by parking this request, and its connection, for as long as the
+        # winner's processor call takes. Fifty retries of one charge become fifty
+        # backends asleep behind one slow card authorisation.
+        #
+        # pg_try_advisory_xact_lock answers immediately instead, so a duplicate
+        # in-flight request costs a 409 and a few milliseconds rather than a
+        # connection and a multi-second wait.
+        if not await try_lock_idempotency_key(session, key):
             raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"idempotency key {key} vanished between claim and read",
-            )
-
-        if existing.request_hash != request_hash:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_409_CONFLICT,
                 detail=(
-                    "idempotency key reused with a different payload: this key is "
-                    "already bound to another charge. Use a new key for a new "
-                    "charge, or resend the original body to replay its result."
+                    f"a charge for idempotency key {key} is already in progress; "
+                    "retry shortly to receive its recorded result"
                 ),
             )
 
-        if not existing.is_completed:
-            # Unreachable in Phase 3: a claim becomes visible to another request
-            # only when it commits, and it commits only once completed. Phase 4
-            # commits the claim up front so an in-flight charge *is* visible, and
-            # this is the branch that will handle it.
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"a charge for idempotency key {key} is still in progress",
-            )
-
-        return JSONResponse(
-            content=existing.response_snapshot, status_code=existing.response_status
-        )
+        # The claim runs in the same transaction as everything below it, so a
+        # request that fails after this point takes the claim down with it and
+        # leaves the key free to retry.
+        if not await claim_key(session, key, request_hash):
+            existing = await load_claim(session, key)
+            if existing is None:  # pragma: no cover - the claim just said it exists
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"idempotency key {key} vanished between claim and read",
+                )
+            return _replay_or_reject(key, existing, request_hash)
 
     account = await session.get(Account, payload.account_id)
     if account is None:
@@ -282,7 +346,7 @@ async def create_charge(
         # A decline is a completed outcome, so the key is finalised against it. A
         # retry replays the decline rather than trying the card again -- the
         # customer's second click must not become a second authorisation attempt.
-        return await _complete(session, key, payment)
+        return await _complete(session, key, request_hash, payment, strategy)
 
     # 4b. Approved. Now, and only now, money moves.
     try:
@@ -291,7 +355,7 @@ async def create_charge(
         # goes negative by exactly what customers were credited, so the ledger
         # still sums to zero.
         house_id = await settlement_account_id(session, currency)
-        ledger_transaction = await write_charge_posting(
+        ledger_transaction = await write_posting(
             session,
             description=f"charge {payment.id}",
             debit_account_id=house_id,
@@ -314,7 +378,7 @@ async def create_charge(
     # One commit. The payment reaching 'succeeded', the postings that justify it,
     # and the idempotency key that now owes this response become visible in the
     # same instant, or none of them do.
-    return await _complete(session, key, payment)
+    return await _complete(session, key, request_hash, payment, strategy)
 
 
 @router.get("/{payment_id}", response_model=ChargeOut)
