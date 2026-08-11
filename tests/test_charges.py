@@ -13,7 +13,14 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 
 from app.db import engine
 from app.ledger import settlement_account_name
-from tests.conftest import count_rows, create_account, create_charge, get_balance, scalar
+from tests.conftest import (
+    count_rows,
+    create_account,
+    create_charge,
+    get_balance,
+    idempotency_headers,
+    scalar,
+)
 
 
 async def test_a_successful_charge_credits_the_account(client: AsyncClient) -> None:
@@ -205,7 +212,9 @@ async def test_a_currency_mismatch_is_rejected_before_anything_is_written(
     account = await create_account(client, "Rupee customer", currency="INR")
 
     response = await client.post(
-        "/charges", json={"account_id": account, "amount": 250000, "currency": "USD"}
+        "/charges",
+        json={"account_id": account, "amount": 250000, "currency": "USD"},
+        headers=idempotency_headers(),
     )
 
     assert response.status_code == 422, response.text
@@ -218,10 +227,14 @@ async def test_a_charge_against_an_unknown_account_is_404(client: AsyncClient) -
     response = await client.post(
         "/charges",
         json={"account_id": "00000000-0000-0000-0000-000000000000", "amount": 1000},
+        headers=idempotency_headers(),
     )
 
     assert response.status_code == 404, response.text
     assert await count_rows("payments") == 0
+    # The failed request took its idempotency claim down with it, so the key was
+    # never consumed and the caller may retry with it.
+    assert await count_rows("idempotency_keys") == 0
 
 
 async def test_fetching_an_unknown_charge_is_404(client: AsyncClient) -> None:
@@ -236,7 +249,11 @@ async def test_a_charge_amount_must_be_positive_minor_units(
     """Same money rule as the ledger: an integer count of minor units, or a 422."""
     account = await create_account(client, "Customer")
 
-    response = await client.post("/charges", json={"account_id": account, "amount": amount})
+    response = await client.post(
+        "/charges",
+        json={"account_id": account, "amount": amount},
+        headers=idempotency_headers(),
+    )
 
     assert response.status_code == 422, response.text
     assert await count_rows("payments") == 0

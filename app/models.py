@@ -17,6 +17,7 @@ from datetime import datetime
 from enum import StrEnum
 
 import sqlalchemy as sa
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -213,5 +214,55 @@ class Payment(Base):
         sa.CheckConstraint(
             "(status = 'succeeded') = (ledger_transaction_id IS NOT NULL)",
             name="ck_payments_posting_matches_status",
+        ),
+    )
+
+
+class IdempotencyKey(Base):
+    """One claimed ``Idempotency-Key`` and the response it owes to any retry.
+
+    The primary key *is* the idempotency key, so "who owns this key" is answered
+    by the same mechanism that answers "does this row exist" -- there is no
+    application-level ownership check that could disagree with the database.
+
+    Rows are written by ``app/idempotency.py``, never by the ORM: the claim needs
+    ``INSERT ... ON CONFLICT`` semantics that a session flush cannot express. This
+    class exists so the table is part of ``Base.metadata`` (Alembic autogenerate,
+    and a single place to read the schema) rather than to be queried through.
+    """
+
+    __tablename__ = "idempotency_keys"
+
+    key: Mapped[str] = mapped_column(sa.Text, primary_key=True)
+    request_hash: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    # NULL until the charge finishes. The CHECK constraint in migration 0004 ties
+    # these two to `status`, so a 'completed' key with nothing to replay cannot be
+    # stored.
+    response_snapshot: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    response_status: Mapped[int | None] = mapped_column(sa.Integer, nullable=True)
+    # 'in_progress' | 'completed'. In Phase 3 a committed row is always
+    # 'completed', because the claim and the charge share one transaction: if the
+    # charge does not commit, the claim does not either. Phase 4 is what makes
+    # 'in_progress' observable, by committing the claim separately so a second
+    # request can see that one is already running.
+    status: Mapped[str] = mapped_column(
+        sa.Text, nullable=False, server_default=sa.text("'in_progress'")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        sa.TIMESTAMP(timezone=True), nullable=False, server_default=sa.text("now()")
+    )
+    expires_at: Mapped[datetime] = mapped_column(sa.TIMESTAMP(timezone=True), nullable=False)
+
+    __table_args__ = (
+        sa.CheckConstraint(
+            "status IN ('in_progress', 'completed')", name="ck_idempotency_keys_status"
+        ),
+        sa.CheckConstraint(
+            "(status = 'completed') = "
+            "(response_snapshot IS NOT NULL AND response_status IS NOT NULL)",
+            name="ck_idempotency_keys_snapshot_matches_status",
+        ),
+        sa.CheckConstraint(
+            "expires_at > created_at", name="ck_idempotency_keys_expiry_after_creation"
         ),
     )
