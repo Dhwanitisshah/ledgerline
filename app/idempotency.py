@@ -25,18 +25,32 @@ slip through and charge the card twice.
 
 ## What the claim shares with the charge
 
-The claim runs **inside the charge's transaction**. That single decision settles
-what happens when a request dies partway through: if the charge does not commit,
-neither does the claim, so the key was never consumed and a retry is free to try
-again. There is no cleanup path, no reaper for half-finished keys, and no state in
-which a customer is locked out by a key that a crash left behind.
+Through Phase 4 the claim ran **inside the charge's single transaction**, and that
+one decision settled what happened when a request died partway through: if the
+charge did not commit, neither did the claim, so the key was never consumed and a
+retry was free to try again. No cleanup path, no reaper, no customer locked out by
+a key a crash left behind. The cost was that ``status = 'in_progress'`` was never
+observable in committed data -- a key became visible only once it was already
+'completed'.
 
-The cost is that ``status = 'in_progress'`` is never observable in committed data
-during Phase 3 -- a key becomes visible only once it is already 'completed'. The
-column is here because Phase 4 needs it: handling two *simultaneous* requests for
-one key means committing the claim on its own, before the processor is called, so
-that the second request can see a charge is already running. That is exactly the
-work Phase 4 does, and it is why the in-flight case is out of scope here.
+**Phase 5a splits that transaction in two** (see app/routers/charges.py), and the
+claim now commits with the payment, before the processor is called. Both halves of
+the old trade-off invert:
+
+* ``in_progress`` becomes real. A concurrent duplicate is now turned away by
+  committed data rather than by the advisory lock, which is what Phase 3's
+  docstring predicted and Phase 4 got to by a different route.
+* A crash after that first commit **does** consume the key. The lockout this
+  module used to make impossible is now possible, and it is bounded by the sweep
+  rather than by the 24-hour TTL: ``app/reconcile.py`` settles the abandoned
+  payment and finalises its key in the same transaction, so the customer's next
+  retry replays the reconciled outcome instead of waiting a day. That is what the
+  ``payment_id`` column exists for.
+
+What did not change: a request that fails *before* that first commit -- unknown
+account, currency mismatch, bad body -- still takes its claim down with it and
+leaves the key free. Those paths never reach the processor, so there is nothing to
+reconcile and no reason to consume anything.
 """
 
 import hashlib
@@ -129,6 +143,10 @@ _CLAIM_SQL = text(
         status            = 'in_progress',
         response_snapshot = NULL,
         response_status   = NULL,
+        -- Reset with everything else. A reclaimed key is a new claim, and leaving
+        -- it pointing at the previous charge's payment would give the sweep a
+        -- key whose payment it has nothing to do with.
+        payment_id        = NULL,
         created_at        = now(),
         expires_at        = EXCLUDED.expires_at
     WHERE idempotency_keys.expires_at <= now()
@@ -162,6 +180,22 @@ _READ_BACK_SQL = text(
     """
 )
 
+_BIND_PAYMENT_SQL = text(
+    "UPDATE idempotency_keys SET payment_id = :payment_id WHERE key = :key"
+)
+
+# Only unfinished claims. A completed key already holds the response it owes, and
+# the sweep overwriting that would replace a real recorded answer with a
+# reconstructed one -- for a payment whose request, by definition, got far enough
+# to record it.
+_KEY_FOR_PAYMENT_SQL = text(
+    """
+    SELECT key
+    FROM idempotency_keys
+    WHERE payment_id = :payment_id AND status = 'in_progress'
+    """
+)
+
 
 async def claim_key(session: AsyncSession, key: str, request_hash: str) -> bool:
     """Try to take ownership of ``key``. True when this request now owns it.
@@ -178,6 +212,37 @@ async def claim_key(session: AsyncSession, key: str, request_hash: str) -> bool:
         },
     )
     return result.first() is not None
+
+
+async def bind_payment(session: AsyncSession, key: str, payment_id: uuid.UUID) -> None:
+    """Record which payment this key claimed (Phase 5a).
+
+    Runs in the transaction that commits the payment, so the link and the thing it
+    links to become durable together. A key pointing at a payment that does not
+    exist is therefore not a state the database can be left in.
+
+    The link is needed in exactly one direction and for exactly one reason: when
+    the sweep settles a payment whose request died, it has to find that request's
+    key and finalise it. Without this column the sweep can fix the money and still
+    leave the customer's retries answered with 409 until the key expires -- a
+    24-hour lockout caused entirely by our own crash.
+    """
+    await session.execute(_BIND_PAYMENT_SQL, {"key": key, "payment_id": payment_id})
+
+
+async def unfinished_key_for_payment(
+    session: AsyncSession, payment_id: uuid.UUID
+) -> str | None:
+    """The still-open key that claimed ``payment_id``, if there is one.
+
+    Returns None in three cases that are all ordinary rather than exceptional: the
+    key already completed (the request got its answer out before dying, or the
+    sweep has already been here), the key expired and was reclaimed by someone
+    else, or the charge ran on the naive claim path, which writes no key until the
+    end. In all three there is nothing for the sweep to finalise.
+    """
+    row = (await session.execute(_KEY_FOR_PAYMENT_SQL, {"payment_id": payment_id})).first()
+    return None if row is None else row.key
 
 
 async def load_claim(session: AsyncSession, key: str) -> ExistingClaim | None:

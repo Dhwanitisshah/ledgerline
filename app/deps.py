@@ -6,7 +6,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.db import async_session
-from app.processor import FakeProcessor, ProcessorAdapter
+from app.processor import FakeProcessor, ProcessorAdapter, ProcessorBooks
+
+# The fake processor's books, bound to the same engine as everything else because
+# this project has one database. They are handed the *session factory*, not a
+# session, so that every write the processor makes opens its own transaction and
+# commits independently of whatever the request is doing. See app/processor.py --
+# that independence is the whole of Phase 5a.
+processor_books = ProcessorBooks(async_session)
 
 
 async def get_session() -> AsyncIterator[AsyncSession]:
@@ -32,4 +39,5 @@ def get_processor() -> ProcessorAdapter:
     return FakeProcessor(
         outcome=settings.PROCESSOR_OUTCOME,
         latency_ms=settings.PROCESSOR_LATENCY_MS,
+        books=processor_books,
     )

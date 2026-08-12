@@ -88,6 +88,14 @@ class ChargeCreate(BaseModel):
     # processor adapter lands.
     force_outcome: ProcessorOutcome | None = None
     force_latency_ms: StrictInt | None = Field(default=None, ge=0, le=30_000)
+    # Phase 5a. Abandons the request immediately after the processor answers and
+    # before anything is committed on the settlement side -- the exact instant the
+    # Phase 2 docstring named as unrecoverable. It is a raised exception rather
+    # than an os._exit(), and from Postgres's point of view those are the same
+    # event: the transaction is abandoned without committing. What it cannot
+    # simulate is the process not coming back, which is why the sweep is a separate
+    # process and not a `finally:` block.
+    force_crash_after_processor: bool = False
 
 
 class WithdrawalCreate(BaseModel):

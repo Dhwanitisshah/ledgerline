@@ -19,9 +19,14 @@ from app.main import app
 # DELETE on the ledger tables, and TRUNCATE does not fire UPDATE/DELETE triggers.
 # This is the single sanctioned way to clear ledger state, and it exists only for
 # tests -- no application code path removes a ledger row.
+#
+# ``processor_charges`` is in the list but is not Ledgerline's data (see
+# app/models.py). It is cleared between tests for the same reason the rest is: a
+# fake processor that remembered yesterday's charges would let one test's attempt
+# reference resolve inside another test's sweep.
 _TRUNCATE_SQL = text(
     "TRUNCATE TABLE ledger_entries, ledger_transactions, payments, "
-    "idempotency_keys, accounts RESTART IDENTITY CASCADE"
+    "idempotency_keys, processor_charges, accounts RESTART IDENTITY CASCADE"
 )
 
 

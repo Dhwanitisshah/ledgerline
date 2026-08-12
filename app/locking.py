@@ -17,6 +17,12 @@ Two mechanisms, chosen for two different shapes of problem:
     A row lock on ``accounts``, taken with ``SELECT ... FOR UPDATE``. Real row,
     real lock, held to the end of the transaction.
 
+``try_lock_payment_for_settlement``
+    A row lock on ``payments``, taken with ``SELECT ... FOR UPDATE SKIP LOCKED``.
+    The skipping variant, because the reconciler is a queue worker and a payment
+    another worker already holds is not something to wait for -- it is something to
+    leave alone and move on from.
+
 Both are transaction-scoped rather than session-scoped, which matters more than it
 looks: a transaction-scoped lock is released by ``COMMIT``, by ``ROLLBACK``, and by
 the backend dying. There is no path -- including a hard crash mid-charge -- that
@@ -65,6 +71,19 @@ _TRY_ADVISORY_LOCK_SQL = text("SELECT pg_try_advisory_xact_lock(:lock_id) AS acq
 # by SUM over ledger_entries and always have been.
 _LOCK_ACCOUNT_SQL = text("SELECT id FROM accounts WHERE id = :account_id FOR UPDATE")
 
+# SKIP LOCKED turns this from a lock into a claim: rows another transaction holds
+# are simply not returned, rather than making this one wait. The status predicate
+# is inside the locked statement on purpose -- checking 'is it still processing?'
+# before taking the lock would be the same check-then-act shape Phase 4 is about.
+_LOCK_PAYMENT_FOR_SETTLEMENT_SQL = text(
+    """
+    SELECT id
+    FROM payments
+    WHERE id = :payment_id AND status = 'processing'
+    FOR UPDATE SKIP LOCKED
+    """
+)
+
 
 async def try_lock_idempotency_key(session: AsyncSession, key: str) -> bool:
     """Try to become the request that charges ``key``. False means someone else is.
@@ -95,4 +114,31 @@ async def lock_account_for_update(session: AsyncSession, account_id: uuid.UUID) 
     exactly the intent -- they are the ones that can overdraw it.
     """
     result = await session.execute(_LOCK_ACCOUNT_SQL, {"account_id": account_id})
+    return result.first() is not None
+
+
+async def try_lock_payment_for_settlement(
+    session: AsyncSession, payment_id: uuid.UUID
+) -> bool:
+    """Claim a 'processing' payment for reconciliation. False means leave it alone.
+
+    False collapses three situations that all warrant the same response:
+
+    * another sweep is already settling it (the row is locked),
+    * the request that created it woke up and settled it first,
+    * it was never in ``processing`` to begin with.
+
+    None of them is an error and none is worth waiting on, which is precisely why
+    this is ``SKIP LOCKED`` rather than plain ``FOR UPDATE``. Two reconcilers
+    running against one backlog should divide it, not queue behind each other on
+    the same first row -- and a blocking lock here would let one slow processor
+    lookup stall every worker in the fleet.
+
+    The lock is held until the caller's transaction ends, so the settlement it
+    guards -- read the status, ask the processor, write the posting, move the
+    payment -- is atomic against any other settlement of the same payment.
+    """
+    result = await session.execute(
+        _LOCK_PAYMENT_FOR_SETTLEMENT_SQL, {"payment_id": payment_id}
+    )
     return result.first() is not None

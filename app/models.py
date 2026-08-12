@@ -166,8 +166,15 @@ class Payment(Base):
     the atomicity guarantee of this phase written down where the database can
     enforce it rather than left to the route to remember.
 
-    Still absent, on purpose: an idempotency key (Phase 3), any locking or version
-    column (Phase 4), and any outbox linkage (Phase 5).
+    Phase 5a gives ``processing`` a second meaning it did not have before. Under
+    ``CHARGE_DURABILITY=durable_intent`` this row is **committed** before the
+    processor is called, so a payment sitting in ``processing`` is no longer
+    necessarily a charge in flight -- it may be a charge whose request died. The
+    two are indistinguishable from the row alone, which is exactly why the sweep
+    in ``app/reconcile.py`` resolves them against the processor's records rather
+    than by guessing from a timestamp.
+
+    Still absent, on purpose: any outbox linkage (Phase 5b).
     """
 
     __tablename__ = "payments"
@@ -235,6 +242,15 @@ class IdempotencyKey(Base):
 
     key: Mapped[str] = mapped_column(sa.Text, primary_key=True)
     request_hash: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    # Which payment this key claimed, bound in the same transaction that commits
+    # the payment (Phase 5a). NULL while a claim exists but no payment does yet,
+    # and NULL forever on the naive claim path, which writes its key only at the
+    # end. The sweep needs this: when it settles a payment whose request crashed,
+    # it has to finalise that request's key too, or the customer is locked out of
+    # their own charge for the full 24h TTL over a failure that was ours.
+    payment_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid, sa.ForeignKey("payments.id"), nullable=True
+    )
     # NULL until the charge finishes. The CHECK constraint in migration 0004 ties
     # these two to `status`, so a 'completed' key with nothing to replay cannot be
     # stored.
@@ -265,4 +281,57 @@ class IdempotencyKey(Base):
         sa.CheckConstraint(
             "expires_at > created_at", name="ck_idempotency_keys_expiry_after_creation"
         ),
+    )
+
+
+class ProcessorCharge(Base):
+    """**Not Ledgerline's data.** The fake processor's own books, standing in for
+    a third party's database.
+
+    Read the rest of this module as the money model; read this class as somebody
+    else's system that happens to be hosted in the same Postgres because there is
+    no second server in this project. The distinction is not decoration -- it is
+    the entire mechanism of Phase 5a:
+
+    * It is written by ``app/processor.py`` through **its own session, on its own
+      connection, in its own transaction**, which commits independently of
+      whatever Ledgerline is doing. That is what makes the crash real: when the
+      charge transaction rolls back, this row stays. The card was charged.
+    * Nothing else in the codebase may query it, join against it, or add a foreign
+      key to it. The only sanctioned reader is ``ProcessorAdapter.lookup``, which
+      is the seam a real processor's "retrieve charge by idempotency key" API
+      would sit behind.
+
+    It lives in ``Base.metadata`` for one reason only: so Alembic autogenerate
+    knows the table exists and does not propose dropping it. Do not read that as
+    ownership.
+
+    ``attempt_ref`` is the primary key and is the payment id Ledgerline sends as
+    the processor-side idempotency key. Charging the same ``attempt_ref`` twice
+    returns the first outcome rather than charging again -- which is what a real
+    processor does with an idempotency key, and what makes it safe for the sweep
+    to ask about an attempt whose fate it does not know.
+    """
+
+    __tablename__ = "processor_charges"
+
+    attempt_ref: Mapped[uuid.UUID] = mapped_column(sa.Uuid, primary_key=True)
+    processor_ref: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    amount: Mapped[int] = mapped_column(sa.BigInteger, nullable=False)
+    currency: Mapped[str] = mapped_column(sa.CHAR(3), nullable=False)
+    # 'success' | 'failure', matching app.processor.ProcessorOutcome. Stored as
+    # TEXT rather than sharing the payment_status enum: this is the processor's
+    # vocabulary, not ours, and coupling the two types would be a lie about who
+    # owns the values.
+    outcome: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    failure_reason: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        sa.TIMESTAMP(timezone=True), nullable=False, server_default=sa.text("now()")
+    )
+
+    __table_args__ = (
+        sa.CheckConstraint(
+            "outcome IN ('success', 'failure')", name="ck_processor_charges_outcome"
+        ),
+        sa.CheckConstraint("amount > 0", name="ck_processor_charges_amount_positive"),
     )

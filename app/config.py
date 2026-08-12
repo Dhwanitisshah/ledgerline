@@ -1,7 +1,7 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.processor import ProcessorOutcome
-from app.strategies import ClaimStrategy, WithdrawalGuard
+from app.strategies import ChargeDurability, ClaimStrategy, WithdrawalGuard
 
 
 class Settings(BaseSettings):
@@ -48,6 +48,28 @@ class Settings(BaseSettings):
     # subsequent INSERT are two statements with a round trip between them. This
     # only makes an existing window wide enough to hit reliably.
     NAIVE_RACE_WINDOW_MS: int = 0
+
+    # --- Durability and reconciliation (Phase 5a) --------------------------------
+    # When the charge attempt is committed relative to the processor call. The
+    # naive value is the Phases 2-4 flow, preserved so the crash gap can be
+    # reproduced; see app/strategies.py.
+    CHARGE_DURABILITY: ChargeDurability = ChargeDurability.DURABLE_INTENT
+
+    # How long a payment may sit in 'processing' before the sweep treats it as
+    # abandoned by the request that created it. This is a *timeout on our own
+    # crash recovery*, not a timeout on the processor: a healthy charge passes
+    # through 'processing' in the time one authorisation takes. 60s is comfortably
+    # longer than any processor call the fake makes, and short enough that a
+    # customer is not left unresolved for long. Tests drive it to 0.
+    RECONCILE_STUCK_AFTER_SECONDS: int = 60
+
+    # Most payments one sweep will settle. A bound rather than "all of them" so a
+    # backlog is worked through in steady batches instead of one transaction that
+    # holds locks on thousands of rows.
+    RECONCILE_BATCH_SIZE: int = 100
+
+    # Seconds between passes when the sweep runs as a loop (python -m app.reconcile).
+    RECONCILE_INTERVAL_SECONDS: int = 10
 
 
 settings = Settings()
