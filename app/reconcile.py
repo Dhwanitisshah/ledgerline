@@ -48,6 +48,22 @@ constructed *here*, minutes later, from the processor's own record. The money
 appears in the ledger exactly once, with the same two-legged balanced posting the
 charge route would have written, and the customer's retry gets the recorded answer.
 
+## Two callers, one settlement
+
+Since Phase 5b this module has a second caller: ``POST /webhooks``. When the
+processor pushes a callback about an attempt, the receiver does **not** read the
+event's ``type`` and write the corresponding status -- it calls
+:func:`reconcile_payment` with the attempt reference, exactly as the sweep does.
+
+So the webhook decides *when* to settle and this module decides *what* the
+settlement is, on the processor's authority. The push path is a latency
+optimisation on the pull path rather than a second, differently-behaved
+implementation of it, which means a replayed, reordered or forged webhook cannot
+move money the processor has no record of. The worst it can do is cause a lookup.
+
+Settling as succeeded also writes the ``payment.succeeded`` outbox event, in this
+transaction, next to the posting. Money moved here, so an event is owed here.
+
 ## Why each payment gets its own transaction
 
 One payment, one transaction, one commit. A batch-wide transaction would mean a
@@ -86,6 +102,7 @@ And what it does not give:
 
 import argparse
 import asyncio
+import json
 import logging
 import uuid
 from dataclasses import dataclass, field
@@ -99,6 +116,7 @@ from app.idempotency import finalize_key, unfinished_key_for_payment
 from app.ledger import LedgerInvariantError, settlement_account_id, write_posting
 from app.locking import try_lock_payment_for_settlement
 from app.models import Payment, PaymentStatus
+from app.outbox import record_payment_succeeded
 from app.payments import transition
 from app.processor import ProcessorAdapter
 from app.schemas import ChargeOut
@@ -285,6 +303,15 @@ async def reconcile_payment(
         payment.processor_ref = result.processor_ref
         payment.ledger_transaction_id = ledger_transaction.id
         transition(payment, PaymentStatus.SUCCEEDED)
+
+        # The outbox event, in this transaction, next to the posting -- exactly as
+        # the charge route writes it (Phase 5b). Money moved here, so an event is
+        # owed here, and a consumer must not be able to tell that this charge
+        # settled four minutes late through a recovery path rather than inline.
+        # This is also why the event lives at the point of settlement rather than
+        # in the charge route: there are three ways a payment reaches 'succeeded'
+        # and only one of them is a request.
+        await record_payment_succeeded(session, payment)
         outcome = ReconcileOutcome.SETTLED_SUCCEEDED
 
     else:
@@ -403,11 +430,17 @@ async def _main() -> None:  # pragma: no cover - CLI
     parser.add_argument(
         "--interval-seconds", type=int, default=None, help="seconds between passes when looping."
     )
-    args = parser.parse_args()
-
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)-7s %(name)s: %(message)s"
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        dest="list_only",
+        help=(
+            "print the candidate payment ids as a JSON array and exit, settling "
+            "nothing. The 'what would the sweep do?' question, answerable during an "
+            "incident without doing anything irreversible to find out."
+        ),
     )
+    args = parser.parse_args()
 
     # Imported here rather than at module scope so that importing this module for
     # its functions -- which the tests do -- does not build an engine as a side
@@ -415,6 +448,31 @@ async def _main() -> None:  # pragma: no cover - CLI
     from app.db import async_session, engine
     from app.deps import processor_books
     from app.processor import FakeProcessor
+
+    if args.list_only:
+        # Logging is deliberately not configured on this path: stdout must carry the
+        # JSON and nothing else, because scripts/smoke_phase5.ps1 pipes it straight
+        # into ConvertFrom-Json.
+        stuck_after = (
+            settings.RECONCILE_STUCK_AFTER_SECONDS
+            if args.stuck_after_seconds is None
+            else args.stuck_after_seconds
+        )
+        try:
+            async with async_session() as session:
+                candidates = await find_stuck_payments(
+                    session,
+                    stuck_after_seconds=stuck_after,
+                    batch_size=settings.RECONCILE_BATCH_SIZE,
+                )
+            print(json.dumps([str(payment_id) for payment_id in candidates]))
+        finally:
+            await engine.dispose()
+        return
+
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)-7s %(name)s: %(message)s"
+    )
 
     # Only `lookup` is ever called on this, so the configured outcome and latency
     # are irrelevant. What matters is that it has the books.

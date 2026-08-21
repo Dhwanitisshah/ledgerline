@@ -9,11 +9,13 @@ float-to-money conversion this project exists to prevent. ``1000.0`` and
 
 import uuid
 from datetime import datetime
+from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 from app.models import EntryDirection, PaymentStatus
 from app.processor import ProcessorOutcome
+from app.webhooks import MAX_EVENT_ID_LENGTH
 
 
 class AccountCreate(BaseModel):
@@ -114,6 +116,60 @@ class WithdrawalOut(BaseModel):
     # authoritative at the moment of commit; it is returned mainly so a caller (or
     # a concurrency harness) can see the serialisation actually happening.
     balance_after: int
+
+
+class WebhookEventType(StrEnum):
+    """The processor callbacks this receiver understands.
+
+    Typed as an enum so an unrecognised event type is a 422 at the door rather than
+    a silently ignored body. That is the conservative direction: a provider sending
+    us something new should be a loud failure we notice and add support for, not a
+    200 that quietly discards it while telling them it was handled.
+
+    Note that neither value decides anything. See app/routers/webhooks.py -- the
+    type is recorded, and the processor's books are what settle the payment.
+    """
+
+    CHARGE_SUCCEEDED = "charge.succeeded"
+    CHARGE_FAILED = "charge.failed"
+
+
+class WebhookData(BaseModel):
+    """The event's subject: which charge attempt it is about.
+
+    ``attempt_ref`` is the processor-side idempotency key Ledgerline sent with the
+    charge, which is the payment id. Typed as a UUID so a malformed reference is a
+    422 rather than a lookup that mysteriously finds nothing.
+    """
+
+    attempt_ref: uuid.UUID
+
+
+class WebhookIn(BaseModel):
+    """One processor callback, in the shape providers actually send.
+
+    ``id`` is the *provider's* event id and is a string, not a UUID: real providers
+    send things like ``evt_1a2b3c``. It is the deduplication key, so the only thing
+    that genuinely matters about it is that the provider repeats it verbatim on a
+    redelivery -- which is exactly what makes redelivery detectable.
+    """
+
+    id: str = Field(min_length=1, max_length=MAX_EVENT_ID_LENGTH)
+    type: WebhookEventType
+    data: WebhookData
+
+
+class WebhookOut(BaseModel):
+    event_id: str
+    # False on the delivery that did the work, True on every copy after it. The
+    # provider does not care; an operator reading logs after an incident does, and
+    # it is what the tests and the smoke script assert to show the second delivery
+    # was a no-op.
+    duplicate: bool
+    # What handling the event did, as an app.reconcile.ReconcileOutcome value. A
+    # duplicate quotes the *original* delivery's outcome rather than recomputing
+    # one, so replaying an event gives a consistent answer every time.
+    outcome: str
 
 
 class ChargeOut(BaseModel):

@@ -20,13 +20,16 @@ from app.main import app
 # This is the single sanctioned way to clear ledger state, and it exists only for
 # tests -- no application code path removes a ledger row.
 #
-# ``processor_charges`` is in the list but is not Ledgerline's data (see
-# app/models.py). It is cleared between tests for the same reason the rest is: a
-# fake processor that remembered yesterday's charges would let one test's attempt
-# reference resolve inside another test's sweep.
+# ``processor_charges`` and ``event_deliveries`` are in the list but are not
+# Ledgerline's data (see app/models.py). They are cleared between tests for the
+# same reason the rest is: a fake processor that remembered yesterday's charges
+# would let one test's attempt reference resolve inside another test's sweep, and a
+# consumer that remembered yesterday's deliveries would make every event in the
+# next test look like a duplicate that had already been handled.
 _TRUNCATE_SQL = text(
     "TRUNCATE TABLE ledger_entries, ledger_transactions, payments, "
-    "idempotency_keys, processor_charges, accounts RESTART IDENTITY CASCADE"
+    "idempotency_keys, processor_charges, outbox_events, event_deliveries, "
+    "webhook_events, accounts RESTART IDENTITY CASCADE"
 )
 
 

@@ -71,5 +71,17 @@ class Settings(BaseSettings):
     # Seconds between passes when the sweep runs as a loop (python -m app.reconcile).
     RECONCILE_INTERVAL_SECONDS: int = 10
 
+    # --- The outbox publisher (Phase 5b) -----------------------------------------
+    # Most events one publish pass will deliver. A bound rather than "drain it" so
+    # that a pass terminates under sustained load -- which `--once` and anyone
+    # trying to stop the worker both depend on.
+    OUTBOX_BATCH_SIZE: int = 100
+
+    # Seconds between passes when the publisher runs as a loop
+    # (python -m app.publisher). This is the upper bound on how stale a downstream
+    # consumer's view can be, and nothing more: the event itself was committed with
+    # the money and is not at risk while it waits.
+    OUTBOX_INTERVAL_SECONDS: int = 5
+
 
 settings = Settings()

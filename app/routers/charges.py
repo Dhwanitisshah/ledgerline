@@ -1,6 +1,6 @@
 """The charge flow: a payment lifecycle wrapped around a processor call.
 
-Four properties live here now. The first was established in Phase 2 and is the one
+Five properties live here now. The first was established in Phase 2 and is the one
 everything else is built on:
 
     **A charge that fails moves no money. Not less money -- none.**
@@ -13,11 +13,22 @@ The third arrived in Phase 4:
 
     **A duplicate request in flight is turned away, not parked.**
 
-And the fourth is Phase 5a, which is the one that required rearranging everything
+The fourth is Phase 5a, which is the one that required rearranging everything
 below:
 
     **A charge that the processor accepted is never silently lost, even if this
     process dies before it can write the result down.**
+
+And the fifth is Phase 5b, which needed only one line added to the settlement:
+
+    **Anything downstream is told about the charge if and only if the money moved.**
+
+That line is ``record_payment_succeeded`` in step 6c. It writes a row to
+``outbox_events`` inside transaction B, next to the postings, and publishes nothing
+-- ``app/publisher.py`` does that afterwards and separately. The temptation it
+replaces is a broker call after the commit, which is a dual write with no safe
+ordering; see app/outbox.py for why there is no arrangement of two writes to two
+systems that survives a crash in between.
 
 ## The problem the arrangement solves
 
@@ -79,14 +90,21 @@ posting, the status and the key land together or not at all.
 
 Under ``durable_intent``:
 
-| Outcome                          | payments row  | ledger rows       | key              |
-| -------------------------------- | ------------- | ----------------- | ---------------- |
-| processor succeeded              | `succeeded`   | committed,balanced| completed        |
-| processor declined               | `failed`      | **never written** | completed        |
-| **crash after processor said ok**| `processing`  | not written       | **consumed**     |
-| ledger invariant violated (bug)  | `processing`  | rolled back       | **consumed**     |
-| bad request before A commits     | no row        | none              | **not consumed** |
-| replayed retry                   | untouched     | untouched         | unchanged        |
+| Outcome                          | payments row | ledger rows     | outbox    | key          |
+| -------------------------------- | ------------ | --------------- | --------- | ------------ |
+| processor succeeded              | `succeeded`  | committed       | **event** | completed    |
+| processor declined               | `failed`     | **never written** | **none**| completed    |
+| **crash after processor said ok**| `processing` | not written     | none      | **consumed** |
+| ledger invariant violated (bug)  | `processing` | rolled back     | rolled back | **consumed** |
+| bad request before A commits     | no row       | none            | none      | not consumed |
+| replayed retry                   | untouched    | untouched       | untouched | unchanged    |
+
+The outbox column tracks the ledger column exactly, in every row, and that is the
+Phase 5b guarantee rather than a coincidence of how the table is laid out: both are
+written by the same transaction, so no failure can produce one without the other.
+Rows three and four are the ones to check -- a crash and a rolled-back settlement
+each leave no event, because there is no money to announce. The sweep emits it
+later, when and if there is.
 
 ("consumed" above means the key is held at ``in_progress`` with no response to
 replay, so retries get a 409 until the sweep finalises it.)
@@ -166,6 +184,7 @@ from app.idempotency import (
 from app.ledger import LedgerInvariantError, settlement_account_id, write_posting
 from app.locking import try_lock_idempotency_key
 from app.models import Account, Payment, PaymentStatus
+from app.outbox import record_payment_succeeded
 from app.payments import transition
 from app.processor import FakeProcessor, ProcessorAdapter
 from app.schemas import ChargeCreate, ChargeOut
@@ -513,9 +532,16 @@ async def create_charge(
     payment.ledger_transaction_id = ledger_transaction.id
     transition(payment, PaymentStatus.SUCCEEDED)
 
+    # 6c. The outbox row, written *here* -- inside transaction B, alongside the
+    #     postings it describes. This is the entire transactional outbox: not a
+    #     publish, not a broker call, just an INSERT that shares a COMMIT with the
+    #     money. The alternative, publishing after the commit, is a dual write with
+    #     no safe ordering; see app/outbox.py. Nothing is delivered by this request.
+    await record_payment_succeeded(session, payment)
+
     # One commit. The payment reaching 'succeeded', the postings that justify it,
-    # and the idempotency key that now owes this response become visible in the
-    # same instant, or none of them do.
+    # the event announcing it, and the idempotency key that now owes this response
+    # become visible in the same instant, or none of them do.
     return await _complete(session, key, request_hash, payment, strategy)
 
 

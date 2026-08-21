@@ -174,7 +174,9 @@ class Payment(Base):
     in ``app/reconcile.py`` resolves them against the processor's records rather
     than by guessing from a timestamp.
 
-    Still absent, on purpose: any outbox linkage (Phase 5b).
+    Still absent, on purpose: any column linking a payment to the outbox events it
+    produced. Phase 5b emits those events and deliberately does not point back
+    here -- see :class:`OutboxEvent`.
     """
 
     __tablename__ = "payments"
@@ -334,4 +336,155 @@ class ProcessorCharge(Base):
             "outcome IN ('success', 'failure')", name="ck_processor_charges_outcome"
         ),
         sa.CheckConstraint("amount > 0", name="ck_processor_charges_amount_positive"),
+    )
+
+
+class OutboxEvent(Base):
+    """One thing that happened, written in the transaction that made it happen.
+
+    This is the whole of the transactional outbox, and everything interesting about
+    it is *where the row is written from* rather than what the row contains. A
+    successful charge writes its ledger entries, moves the payment to ``succeeded``
+    and inserts one of these, in a single transaction with a single commit. So:
+
+        **the event exists if and only if the money moved.**
+
+    Not "usually", not "unless the broker was down". The two cannot disagree
+    because there is only one commit, and a commit is the smallest thing Postgres
+    will do halfway through -- which is to say, not at all.
+
+    Contrast the dual write this replaces: post the ledger entries, commit, then
+    publish to a broker. Two systems, two writes, and a gap between them. Crash in
+    the gap and the money moved with nobody told. Reverse the order and the broker
+    hears about a charge that never committed. There is no ordering of two writes
+    to two systems that is safe, which is why the second write is removed entirely
+    and replaced by a row in the same database.
+
+    Rows are written by ``app/outbox.py`` and consumed by ``app/publisher.py``,
+    never through the ORM: the claim needs ``FOR UPDATE SKIP LOCKED`` semantics
+    that a session flush cannot express. This class exists so the table is part of
+    ``Base.metadata`` rather than to be queried through.
+
+    **No foreign key to ``payments``**, deliberately. An event is a statement about
+    something that happened, and it has to stay readable and publishable on its own
+    terms -- an outbox that joins back into the live money model is one that cannot
+    be drained, archived, or moved to another store without dragging the ledger
+    behind it. The payment id travels *inside* ``payload``, where a consumer can
+    read it, rather than as a constraint.
+    """
+
+    __tablename__ = "outbox_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        sa.Uuid,
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=sa.text("gen_random_uuid()"),
+    )
+    event_type: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    # 'pending' | 'published'. There is no 'publishing' state, and its absence is
+    # the design: an in-flight publish is represented by a row lock held for the
+    # length of one transaction, not by a status somebody has to clean up after a
+    # worker dies mid-flight. A lock is released by the backend dying; a status is
+    # not.
+    status: Mapped[str] = mapped_column(
+        sa.Text, nullable=False, server_default=sa.text("'pending'")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        sa.TIMESTAMP(timezone=True), nullable=False, server_default=sa.text("now()")
+    )
+    published_at: Mapped[datetime | None] = mapped_column(
+        sa.TIMESTAMP(timezone=True), nullable=True
+    )
+    # Committed attempts only; see migration 0006 and app/publisher.py.
+    attempts: Mapped[int] = mapped_column(
+        sa.Integer, nullable=False, server_default=sa.text("0")
+    )
+
+    __table_args__ = (
+        sa.CheckConstraint("status IN ('pending', 'published')", name="ck_outbox_events_status"),
+        sa.CheckConstraint(
+            "(status = 'published') = (published_at IS NOT NULL)",
+            name="ck_outbox_events_published_at_matches_status",
+        ),
+        sa.CheckConstraint("attempts >= 0", name="ck_outbox_events_attempts_positive"),
+    )
+
+
+class EventDelivery(Base):
+    """**Not Ledgerline's data.** The downstream consumer's record of what it has
+    already handled.
+
+    Read this exactly as :class:`ProcessorCharge` asks to be read: somebody else's
+    system, hosted in this Postgres because the project has one database. It is
+    written by ``app/publisher.py``'s sink through **its own session and its own
+    transaction**, and that independence is doing the same job it does for the
+    processor's books -- when the publisher's transaction rolls back, this row
+    stays, which is precisely why a redelivery can find it and decline to act twice.
+
+    The primary key **is** the outbox event id, and that single fact is the entire
+    exactly-once mechanism. The publisher promises at-least-once delivery, because
+    that is the strongest promise any sender can keep across a process that may
+    die. Turning that into an exactly-once *effect* is the receiver's job, and this
+    is how a receiver does it: ``INSERT ... ON CONFLICT (event_id) DO NOTHING``.
+    The second delivery is not detected and rejected by application logic; it
+    collides with a unique index and does nothing.
+
+    A real consumer would keep this table in its own database, and nothing about
+    the argument changes -- which is the point. No foreign key to ``outbox_events``
+    for exactly that reason: a consumer in another process could not declare one.
+    """
+
+    __tablename__ = "event_deliveries"
+
+    event_id: Mapped[uuid.UUID] = mapped_column(sa.Uuid, primary_key=True)
+    event_type: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    delivered_at: Mapped[datetime] = mapped_column(
+        sa.TIMESTAMP(timezone=True), nullable=False, server_default=sa.text("now()")
+    )
+
+
+class WebhookEvent(Base):
+    """One processor callback, recorded so the next copy of it does nothing.
+
+    Providers deliver webhooks **at least once**. Not "occasionally twice under
+    load" -- at least once is the contract, because the provider cannot know
+    whether a response it never received meant the event was handled. A receiver
+    that assumes single delivery is a receiver that will eventually settle one
+    payment twice.
+
+    The primary key is the *provider's* event id, stored as TEXT because that is
+    what providers send. Deduplication is therefore the same mechanism as
+    everywhere else in this project: a unique index, not an application check that
+    could be raced.
+
+    There is no ``in_progress`` status here, unlike :class:`IdempotencyKey`, and
+    the difference is worth understanding rather than smoothing over. This row and
+    the work it describes are written in **one** transaction: if the settlement
+    does not commit, neither does this row, so a redelivery correctly re-processes
+    an event whose handling was lost. That is exactly the property Phase 3's
+    idempotency claim had before Phase 5a had to give it up -- and this table gets
+    to keep it because, unlike a charge, handling a webhook never calls out to a
+    third party mid-transaction.
+
+    ``payment_id`` carries **no foreign key**; see migration 0006. The id in a
+    webhook is a third party's claim about what exists, not a reference this
+    service controls.
+    """
+
+    __tablename__ = "webhook_events"
+
+    event_id: Mapped[str] = mapped_column(sa.Text, primary_key=True)
+    event_type: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    payment_id: Mapped[uuid.UUID | None] = mapped_column(sa.Uuid, nullable=True)
+    # What the handler did, written before the same transaction commits. A row
+    # visible to anyone else has always been processed.
+    outcome: Mapped[str] = mapped_column(
+        sa.Text, nullable=False, server_default=sa.text("'received'")
+    )
+    received_at: Mapped[datetime] = mapped_column(
+        sa.TIMESTAMP(timezone=True), nullable=False, server_default=sa.text("now()")
     )

@@ -65,18 +65,41 @@ jobs:
       - name: Migrate
         run: alembic upgrade head
 
+      # A down-migration nobody runs is a down-migration that does not work. This
+      # round-trips the newest revision -- down to 0005, back up to head -- so a
+      # downgrade() that drops a table it never created, or forgets an index, is a
+      # red build rather than a discovery made during a rollback at 3am. Safe to run
+      # before the suite: the tests TRUNCATE everything they touch anyway.
+      - name: Down-migration round-trips
+        run: |
+          alembic downgrade 0005
+          alembic upgrade head
+
       - name: Lint
         run: ruff check .
 
       - name: Test
         run: pytest
 
-      # The Phase 5a reconciler is a separate process, and the suite deliberately
-      # does not spawn it -- the tests call sweep_once() directly so there is no
-      # background worker to wait on and nothing that can hang. This step covers
-      # the other half: that the CLI entry point itself starts, connects, runs a
-      # pass and *exits*. --once is what makes it short-lived; the timeout is what
-      # turns "it looped forever" into a red build instead of a stuck runner.
+      # Both background workers are separate processes, and the suite deliberately
+      # does not spawn either -- the tests call sweep_once() and publish_once()
+      # directly, so there is no background worker to wait on, nothing to kill, and
+      # nothing that can hang. These steps cover the other half: that each CLI entry
+      # point starts, connects, does one pass and *exits*. --once and --status are
+      # what make them short-lived; the timeout is what turns "it looped forever"
+      # into a red build instead of a stuck runner.
       - name: Reconciler CLI runs and exits
         timeout-minutes: 2
         run: python -m app.reconcile --once
+
+      - name: Reconciler --list runs and exits
+        timeout-minutes: 2
+        run: python -m app.reconcile --list
+
+      - name: Publisher CLI runs and exits
+        timeout-minutes: 2
+        run: python -m app.publisher --once
+
+      - name: Publisher --status runs and exits
+        timeout-minutes: 2
+        run: python -m app.publisher --status
