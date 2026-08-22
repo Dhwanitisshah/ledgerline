@@ -169,6 +169,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, status
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app import metrics
 from app.config import settings
 from app.deps import (
     get_processor,
@@ -490,6 +491,11 @@ async def create_charge(
     result = await processor.charge(
         attempt_ref=payment.id, amount=payload.amount, currency=currency
     )
+
+    # Counted here: the processor answered, so this is a real charge attempt with a
+    # real outcome. Deliberately after the call and before the crash knob, so a
+    # simulated crash still counts the attempt the card actually saw.
+    metrics.observe_charge(succeeded=result.succeeded)
 
     if payload.force_crash_after_processor:
         # Exactly the instant Phase 2 named as unrecoverable. The card has been

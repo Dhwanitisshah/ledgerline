@@ -15,7 +15,7 @@ from sqlalchemy import text
 from app import metrics
 from app.db import engine
 from app.main import app
-from app.middleware import limiter
+from app.middleware import limiter, write_limiter
 
 # TRUNCATE, not DELETE, and deliberately so: the append-only triggers reject
 # DELETE on the ledger tables, and TRUNCATE does not fire UPDATE/DELETE triggers.
@@ -49,6 +49,7 @@ async def client() -> AsyncIterator[AsyncClient]:
     # mistake in it still shows up here. The tests that are *about* limiting set
     # their own limit; see tests/test_hardening.py.
     limiter.reset()
+    write_limiter.reset()
     metrics.reset()
 
     transport = ASGITransport(app=app)

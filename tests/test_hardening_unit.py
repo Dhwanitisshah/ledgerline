@@ -25,6 +25,11 @@ from app.observability import JsonFormatter, RequestIdFilter, new_request_id, re
 from app.ratelimit import FixedWindowLimiter
 from app.strategies import ChargeDurability, ClaimStrategy, WithdrawalGuard
 
+#: A production-shaped database URL. Needed because Phase 7 makes production
+#: refuse the local compose default, so every APP_ENV=production test must supply
+#: one or it fails on a check it was not written to exercise.
+PROD_DB = "postgresql+asyncpg://u:p@db.internal:5432/ledgerline"
+
 # --- Configuration refuses to be unsafe ---------------------------------------------
 
 
@@ -37,12 +42,14 @@ def test_production_defaults_the_knobs_off_without_being_told() -> None:
     opposite arrangement ships an open crash endpoint the day someone forgets a line
     of config.
     """
-    assert Settings(APP_ENV="production").test_affordances_allowed is False
-    assert Settings(APP_ENV="prod").test_affordances_allowed is False
+    assert Settings(APP_ENV="production", DATABASE_URL=PROD_DB).test_affordances_allowed is False
+    assert Settings(APP_ENV="prod", DATABASE_URL=PROD_DB).test_affordances_allowed is False
     assert Settings(APP_ENV="local").test_affordances_allowed is True
 
     # And enabling them on a staging box stays possible, and stays explicit.
-    assert Settings(APP_ENV="production", ALLOW_TEST_AFFORDANCES=True).test_affordances_allowed
+    assert Settings(
+        APP_ENV="production", DATABASE_URL=PROD_DB, ALLOW_TEST_AFFORDANCES=True
+    ).test_affordances_allowed
 
 
 @pytest.mark.parametrize(
@@ -69,9 +76,15 @@ def test_production_refuses_to_start_on_a_deliberately_broken_path(
     load, because by the time anyone notices, the money has already moved.
     """
     with pytest.raises(Exception) as caught:
-        Settings(APP_ENV="production", **{field: value})
+        Settings(APP_ENV="production", DATABASE_URL=PROD_DB, **{field: value})
 
-    assert "refusing to start" in str(caught.value)
+    message = str(caught.value)
+    assert "refusing to start" in message
+    # Asserted specifically, because Phase 7 added a SECOND "refusing to start"
+    # error for a missing DATABASE_URL -- and without a production URL above, this
+    # test tripped over that one instead and passed without ever reaching the
+    # strategy check it is named for.
+    assert field in message or "NAIVE_RACE_WINDOW_MS" in message
 
 
 def test_the_broken_paths_remain_selectable_outside_production() -> None:
@@ -265,3 +278,83 @@ def test_a_counter_with_no_observations_still_declares_itself() -> None:
 def test_the_exposition_ends_with_a_newline() -> None:
     """Required by the format. Scrapers are forgiving about it and the spec is not."""
     assert metrics.render().endswith("\n")
+
+
+# --- Fail-fast configuration (Phase 7) -------------------------------------------
+
+
+def test_a_plain_postgres_url_is_refused_at_startup() -> None:
+    """The trap every platform sets, caught at boot instead of at the first query.
+
+    `fly postgres attach` -- and Render, and Railway -- write a plain
+    `postgres://...` connection string. SQLAlchemy needs the driver named in the
+    scheme, so a deployment that takes the secret verbatim starts cleanly, passes
+    liveness, and then fails every query with an error that mentions neither the
+    platform nor the missing prefix.
+    """
+    with pytest.raises(Exception) as caught:
+        Settings(DATABASE_URL="postgres://u:p@host:5432/db")
+
+    message = str(caught.value)
+    assert "asyncpg driver" in message
+    # The message has to say what to DO, not just what is wrong.
+    assert "postgresql+asyncpg://" in message
+
+
+def test_production_refuses_the_local_database_default() -> None:
+    """A missing secret must not silently become 'connect to localhost'.
+
+    Inside a container that is not a fallback, it is a connection refused on every
+    request, discovered by a customer rather than by the deploy.
+    """
+    with pytest.raises(Exception) as caught:
+        Settings(APP_ENV="production")
+    assert "still the local compose default" in str(caught.value)
+
+    # An explicitly configured production URL is fine.
+    ok = Settings(
+        APP_ENV="production",
+        DATABASE_URL="postgresql+asyncpg://u:p@db.internal:5432/ledgerline",
+    )
+    assert ok.is_production
+
+
+def test_an_unknown_log_format_is_refused() -> None:
+    """A typo here means logs in a shape the ingester drops, discovered during an
+    incident when the logs are the only thing you have."""
+    with pytest.raises(Exception) as caught:
+        Settings(LOG_FORMAT="yaml")
+    assert "LOG_FORMAT must be" in str(caught.value)
+
+    assert Settings(LOG_FORMAT="json").LOG_FORMAT == "json"
+    assert Settings(LOG_FORMAT="text").LOG_FORMAT == "text"
+
+
+# --- Business counters -------------------------------------------------------------
+
+
+def test_charge_and_refund_counters_separate_outcomes() -> None:
+    """These count what the SERVICE did, which is not what HTTP did.
+
+    A declined card is a 201 to HTTP and a failure to the business; a replayed
+    retry is an HTTP request and not a charge at all. Keeping them apart is the
+    reason these exist alongside `http_requests_total`.
+    """
+    metrics.reset()
+    metrics.observe_charge(succeeded=True)
+    metrics.observe_charge(succeeded=True)
+    metrics.observe_charge(succeeded=False)
+    metrics.observe_refund(succeeded=True)
+
+    rendered = metrics.render()
+    assert 'ledgerline_charges_total{outcome="succeeded"} 2' in rendered
+    assert 'ledgerline_charges_total{outcome="failed"} 1' in rendered
+    assert 'ledgerline_refunds_total{outcome="succeeded"} 1' in rendered
+    metrics.reset()
+
+
+def test_the_reconciler_counter_exists_even_before_the_sweep_runs() -> None:
+    """Declared at zero rather than absent: "no such metric" and "nothing stranded"
+    look identical on a dashboard and only one of them is good news."""
+    metrics.reset()
+    assert "ledgerline_reconciler_stuck_found_total 0" in metrics.render()

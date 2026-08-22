@@ -138,12 +138,43 @@ jobs:
           print('image ok:', sys.version.split()[0], 'uid', os.getuid())
           "
 
+      # Phase 7. The load test is a committed, dependency-free script, so CI runs a
+      # short pass of it -- not to measure anything (a shared runner is the wrong
+      # place for latency numbers) but to prove the script still works against the
+      # current API. A benchmark that has silently stopped running is a benchmark
+      # whose numbers in the README are fiction.
+      - name: Load test script runs against the app
+        timeout-minutes: 3
+        env:
+          RATE_LIMIT_ENABLED: "false"
+        run: |
+          uvicorn app.main:app --host 127.0.0.1 --port 8000 &
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8000/health && break
+            sleep 1
+          done
+          python scripts/loadtest.py --url http://127.0.0.1:8000 --iterations 20 --concurrency 5
+
       # The production guard, exercised end to end: selecting a deliberately broken
       # path must abort startup rather than come up healthy and be wrong under load.
+      #
+      # DATABASE_URL is supplied deliberately. Phase 7 added a SECOND startup refusal
+      # for a missing database URL, and without one here the container would abort for
+      # THAT reason -- passing this step while never reaching the strategy check it is
+      # named for. The same false pass had to be fixed in tests/test_hardening_unit.py.
       - name: Production refuses to start on a broken path
         run: |
-          if docker run --rm -e IDEMPOTENCY_CLAIM_STRATEGY=naive ledgerline:ci python -c "import app.config" 2>/dev/null; then
+          set +e
+          output=$(docker run --rm             -e DATABASE_URL="postgresql+asyncpg://u:p@db.internal:5432/ledgerline"             -e IDEMPOTENCY_CLAIM_STRATEGY=naive             ledgerline:ci python -c "import app.config" 2>&1)
+          status=$?
+          set -e
+          if [ $status -eq 0 ]; then
             echo "FAIL: production accepted a deliberately broken strategy" >&2
             exit 1
           fi
-          echo "production correctly refused to start"
+          echo "$output" | grep -q "IDEMPOTENCY_CLAIM_STRATEGY" || {
+            echo "FAIL: refused for the wrong reason:" >&2
+            echo "$output" >&2
+            exit 1
+          }
+          echo "production correctly refused to start, naming the strategy"

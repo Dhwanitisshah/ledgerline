@@ -320,3 +320,81 @@ async def test_concurrent_requests_do_not_corrupt_the_registry(
 
     body = (await client.get("/metrics")).text
     assert "ledgerline_http_requests_total" in body
+
+
+# --- The stricter write tier (Phase 7) ---------------------------------------------
+
+
+async def test_mutating_requests_have_a_tighter_budget_than_reads(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two tiers, because a POST /charges and a GET of a balance are not equally
+    expensive or equally dangerous.
+
+    A read is one indexed SUM. A charge takes an advisory lock, commits twice,
+    calls the processor and writes an outbox row. One shared budget means either
+    the read limit is too tight or the write limit is far too loose, and the second
+    mistake is the one that costs money.
+    """
+    from app.middleware import write_limiter
+
+    account = await create_account(client, "Customer")
+
+    # Reset AFTER the setup write, so the budget below is spent only by the
+    # requests this test is actually about.
+    monkeypatch.setattr(limiter, "limit", 1000)
+    monkeypatch.setattr(write_limiter, "limit", 1)
+    limiter.reset()
+    write_limiter.reset()
+
+    first = await post_charge(client, account, AMOUNT)
+    assert first.status_code == 201, first.text
+
+    second = await post_charge(client, account, AMOUNT)
+    assert second.status_code == 429, second.text
+    assert second.headers["Retry-After"]
+
+    # Reads are untouched: the write budget is exhausted, the read budget is not.
+    balance = await client.get(f"/accounts/{account}/balance")
+    assert balance.status_code == 200, balance.text
+
+
+async def test_the_advertised_remaining_budget_is_the_tighter_one(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A header that reports the more flattering of two limits is a header that
+    lies to a client trying to pace itself."""
+    from app.middleware import write_limiter
+
+    monkeypatch.setattr(limiter, "limit", 1000)
+    monkeypatch.setattr(write_limiter, "limit", 10)
+    limiter.reset()
+    write_limiter.reset()
+
+    created = await client.post("/accounts", json={"name": "x", "currency": "INR"})
+    assert created.status_code == 201
+    # The write tier is the binding constraint, so that is what is advertised.
+    assert created.headers["X-RateLimit-Limit"] == "10"
+
+
+async def test_business_counters_move_on_real_charges_and_refunds(
+    client: AsyncClient,
+) -> None:
+    """End to end: the counters reflect the processor's answers, not HTTP status.
+
+    The declined charge is a 201 and counts as a FAILURE; the replay is a 201 and
+    counts as nothing at all, because no card was touched.
+    """
+    account = await create_account(client, "Customer")
+    charge = await create_charge(client, account, AMOUNT, key="counters")
+    await post_charge(client, account, AMOUNT, key="counters")          # replay
+    await create_charge(client, account, AMOUNT, force_outcome="failure")
+    await refund_charge(client, charge["id"], 1000)
+
+    body = (await client.get("/metrics")).text
+
+    # Two charges reached the processor: one succeeded, one was declined. The
+    # replay reached nothing.
+    assert 'ledgerline_charges_total{outcome="succeeded"} 1' in body
+    assert 'ledgerline_charges_total{outcome="failed"} 1' in body
+    assert 'ledgerline_refunds_total{outcome="succeeded"} 1' in body

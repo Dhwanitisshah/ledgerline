@@ -71,6 +71,24 @@ limiter = FixedWindowLimiter(
     limit=settings.RATE_LIMIT_REQUESTS, window_seconds=settings.RATE_LIMIT_WINDOW_SECONDS
 )
 
+# A second, stricter budget for requests that CHANGE something. Two tiers because
+# reads and writes are not equally expensive or equally dangerous: a GET of a
+# balance is one indexed SUM, while a POST /charges takes an advisory lock, commits
+# twice, calls the processor and writes an outbox row. One shared budget means
+# either the read limit is too tight or the write limit is far too loose, and the
+# second mistake is the one that costs money.
+#
+# Keyed the same way, counted separately: a write consumes from BOTH windows, so a
+# client cannot spend its write budget and then continue reading at full rate on a
+# machine it is already hammering.
+write_limiter = FixedWindowLimiter(
+    limit=settings.RATE_LIMIT_WRITE_REQUESTS,
+    window_seconds=settings.RATE_LIMIT_WINDOW_SECONDS,
+)
+
+#: Methods that change state. Everything else is a read.
+MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
 #: Paths that are never rate limited. A health check refused with a 429 is a
 #: platform that concludes the machine is unhealthy and restarts it -- turning a
 #: rate limiter into an outage.
@@ -136,17 +154,31 @@ class LedgerlineMiddleware:
         method: str = scope.get("method", "GET")
 
         # --- rate limit ---------------------------------------------------------
+        # A mutating request is checked against BOTH windows and reports whichever
+        # is tighter, so the advertised remaining budget is the one that will
+        # actually refuse first rather than the more flattering of the two.
         rate_headers: list[tuple[str, str]] = []
         if settings.RATE_LIMIT_ENABLED and path not in UNLIMITED_PATHS:
-            allowed, remaining, retry_after = limiter.check(client_key(Request(scope)))
+            key = client_key(Request(scope))
+            allowed, remaining, retry_after = limiter.check(key)
+            effective_limit = limiter.limit
+
+            if allowed and method in MUTATING_METHODS:
+                w_allowed, w_remaining, w_retry = write_limiter.check(key)
+                if not w_allowed:
+                    allowed, remaining, retry_after = False, 0, w_retry
+                elif w_remaining < remaining:
+                    remaining, effective_limit = w_remaining, write_limiter.limit
+
             if not allowed:
                 await self._refuse(
                     scope, receive, send, request_id, retry_after, started, method, path
                 )
                 request_id_var.reset(token)
                 return
+
             rate_headers = [
-                ("x-ratelimit-limit", str(limiter.limit)),
+                ("x-ratelimit-limit", str(effective_limit)),
                 ("x-ratelimit-remaining", str(remaining)),
             ]
 

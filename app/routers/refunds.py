@@ -89,6 +89,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app import metrics
 from app.config import settings
 from app.deps import (
     get_processor,
@@ -323,6 +324,8 @@ async def create_refund(
         amount=assessment.amount,
         currency=payment.currency,
     )
+
+    metrics.observe_refund(succeeded=result.succeeded)
 
     refund = Refund(
         payment_id=payment.id,

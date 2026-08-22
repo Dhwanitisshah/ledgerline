@@ -4,6 +4,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from app.processor import ProcessorOutcome
 from app.strategies import ChargeDurability, ClaimStrategy, WithdrawalGuard
 
+#: The local compose default. Named so that production can recognise and refuse it:
+#: silently falling back to localhost inside a container turns a missing secret into
+#: a connection error at the first request, on a machine nobody is watching, instead
+#: of one clear sentence at boot.
+LOCAL_DATABASE_URL = "postgresql+asyncpg://postgres:postgres@localhost:5433/ledgerline"
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
@@ -12,7 +18,7 @@ class Settings(BaseSettings):
     # what decides whether the fake processor's test knobs are reachable over HTTP
     # and whether the deliberately-broken strategy paths may be selected at all.
     APP_ENV: str = "local"
-    DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5433/ledgerline"
+    DATABASE_URL: str = LOCAL_DATABASE_URL
 
     # --- Connection pool (Phase 4) ---------------------------------------------
     # Sized so the concurrency harness can actually be concurrent. With the
@@ -130,6 +136,17 @@ class Settings(BaseSettings):
     RATE_LIMIT_WINDOW_SECONDS: int = 60
     RATE_LIMIT_ENABLED: bool = True
 
+    # A second, stricter budget for requests that CHANGE something -- POST /charges,
+    # POST /charges/{id}/refund, POST /withdrawals, POST /webhooks.
+    #
+    # Two tiers rather than one because reads and writes are not equally expensive
+    # or equally dangerous. A GET of a balance is one indexed SUM; a POST /charges
+    # takes an advisory lock, commits twice, calls the processor and writes an
+    # outbox row. Giving them one shared budget means either the read limit is too
+    # tight or the write limit is far too loose, and the second mistake is the one
+    # that costs money.
+    RATE_LIMIT_WRITE_REQUESTS: int = 120
+
     # Comma-separated origins for CORS, or "" for none. Empty by default: this is an
     # API with no browser client, and an allow-list that starts permissive is one
     # nobody ever tightens.
@@ -154,6 +171,50 @@ class Settings(BaseSettings):
     @property
     def cors_origins(self) -> list[str]:
         return [origin.strip() for origin in self.CORS_ALLOW_ORIGINS.split(",") if origin.strip()]
+
+    @model_validator(mode="after")
+    def _validate_required_configuration(self) -> "Settings":
+        """Fail fast, at startup, on configuration that cannot work.
+
+        Every check here is something that would otherwise surface as a confusing
+        runtime error minutes or hours later, on a machine nobody is watching. The
+        rule this file follows: if a setting can be wrong in a way that makes the
+        process useless, say so before the process claims to be ready.
+        """
+        if self.LOG_FORMAT.strip().lower() not in {"json", "text"}:
+            raise ValueError(
+                f"LOG_FORMAT must be 'json' or 'text', got {self.LOG_FORMAT!r}"
+            )
+
+        # asyncpg is reached through SQLAlchemy, which needs the driver named in the
+        # URL. This is not hypothetical pedantry: `fly postgres attach` writes a
+        # plain `postgres://...` secret, and a deployment that takes it verbatim
+        # fails at the first query with a driver error that names neither Fly nor
+        # the missing prefix. Caught here, it is one sentence at boot.
+        if not self.DATABASE_URL.startswith("postgresql+asyncpg://"):
+            raise ValueError(
+                "DATABASE_URL must use the asyncpg driver, i.e. start with "
+                f"'postgresql+asyncpg://'. Got {self.DATABASE_URL.split('://')[0]}://... "
+                "Platforms that provision Postgres usually hand you a plain "
+                "'postgres://' URL; rewrite the scheme when you set the secret."
+            )
+
+        if not self.is_production:
+            return self
+
+        # From here down: production only.
+
+        # A production deployment that never received a database URL would otherwise
+        # start cleanly, pass its liveness check, and fail every request against a
+        # localhost that does not exist inside the container.
+        if self.DATABASE_URL == LOCAL_DATABASE_URL:
+            raise ValueError(
+                "refusing to start: DATABASE_URL is still the local compose default "
+                "and APP_ENV=production. Set it to the managed database's URL "
+                "(with the postgresql+asyncpg:// scheme)."
+            )
+
+        return self
 
     @model_validator(mode="after")
     def _refuse_broken_paths_in_production(self) -> "Settings":

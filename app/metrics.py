@@ -178,6 +178,53 @@ rate_limited_total = Counter(
     label_names=("route",),
 )
 
+# --- Business counters ---------------------------------------------------------
+#
+# These count what the SERVICE did, as opposed to what HTTP did. `charges_total`
+# and `http_requests_total{route="/charges"}` look similar and answer different
+# questions: a 409 replay is an HTTP request and is NOT a charge, and a declined
+# card is a 201 to HTTP and a failure to the business.
+#
+# ## The multi-process caveat, stated where it matters
+#
+# A counter lives in the memory of the process that incremented it. The charge and
+# refund counters are incremented in the web process and are therefore visible on
+# that process's /metrics, which is correct and complete.
+#
+# `reconciler_stuck_found_total` is NOT. The sweep runs as its own Fly machine
+# (see fly.toml), so it increments a counter in a process that serves no HTTP and
+# that nothing scrapes. Exported here anyway for the case where the sweep runs
+# in-process -- the test suite, and `python -m app.reconcile` on a box you are
+# watching -- and paired with `ledgerline_payments_stuck`, which is read from
+# Postgres on scrape and therefore *is* correct from any process.
+#
+# The real fix for worker counters is a push gateway or a metrics port on the
+# worker itself. Neither is built here, and pretending the counter is fleet-wide
+# would be worse than saying it is not.
+charges_total = Counter(
+    name="ledgerline_charges_total",
+    help=(
+        "Charge attempts that reached the processor, by outcome. Excludes replays "
+        "and requests rejected before the processor was called."
+    ),
+    label_names=("outcome",),
+)
+
+refunds_total = Counter(
+    name="ledgerline_refunds_total",
+    help="Refund attempts that reached the processor, by outcome. Excludes replays.",
+    label_names=("outcome",),
+)
+
+reconciler_stuck_found_total = Counter(
+    name="ledgerline_reconciler_stuck_found_total",
+    help=(
+        "Payments the sweep found stranded in 'processing'. Incremented in the "
+        "RECONCILER process, so it is only visible on /metrics when the sweep runs "
+        "in-process; see ledgerline_payments_stuck for the scrape-time equivalent."
+    ),
+)
+
 # The domain gauges. Set from Postgres on each scrape; see app/observability.py.
 ledger_imbalance = Gauge(
     name="ledgerline_ledger_imbalance_minor_units",
@@ -216,6 +263,9 @@ _ALL = (
     http_request_duration_seconds,
     http_errors_total,
     rate_limited_total,
+    charges_total,
+    refunds_total,
+    reconciler_stuck_found_total,
     ledger_imbalance,
     outbox_pending,
     payments_stuck,
@@ -238,6 +288,30 @@ def observe_unhandled_error(*, route: str) -> None:
 def observe_rate_limited(*, route: str) -> None:
     with _lock:
         rate_limited_total.inc(route=route)
+
+
+def observe_charge(*, succeeded: bool) -> None:
+    """One charge attempt reached the processor and got an answer.
+
+    Called on both outcomes and on neither replay nor rejection: a retry that
+    replays a stored response did not charge anything, and a request refused for a
+    bad account never asked. Counting those would make this metric mean "requests"
+    -- which ``http_requests_total`` already means, better.
+    """
+    with _lock:
+        charges_total.inc(outcome="succeeded" if succeeded else "failed")
+
+
+def observe_refund(*, succeeded: bool) -> None:
+    """One refund attempt reached the processor and got an answer."""
+    with _lock:
+        refunds_total.inc(outcome="succeeded" if succeeded else "failed")
+
+
+def observe_stuck_payment_found() -> None:
+    """The sweep found one payment stranded in 'processing'. See the caveat above."""
+    with _lock:
+        reconciler_stuck_found_total.inc()
 
 
 def set_domain_gauges(values: dict[str, int]) -> None:

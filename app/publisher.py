@@ -99,6 +99,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import settings
+from app.observability import configure_logging
 from app.outbox import (
     PendingEvent,
     claim_next_pending,
@@ -457,9 +458,11 @@ async def _main() -> None:  # pragma: no cover - CLI
             await _print_status(async_session, sink)
             return
 
-        logging.basicConfig(
-            level=logging.INFO, format="%(asctime)s %(levelname)-7s %(name)s: %(message)s"
-        )
+        # Structured, same as the web process. A worker whose logs are shaped
+        # differently from the API's is a worker whose logs get dropped by the ingester
+        # -- and these three are exactly the processes nobody is watching when they
+        # matter, so their output has to survive the pipeline unassisted.
+        configure_logging(log_format=settings.LOG_FORMAT, level=settings.LOG_LEVEL)
 
         if args.once:
             report = await publish_once(async_session, sink, batch_size=args.batch_size)

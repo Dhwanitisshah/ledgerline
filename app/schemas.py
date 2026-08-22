@@ -73,6 +73,18 @@ class TransactionOut(BaseModel):
 
 
 class ChargeCreate(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "account_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                    "amount": 250000,
+                    "currency": "INR",
+                }
+            ]
+        }
+    )
+
     account_id: uuid.UUID
     # Minor units, StrictInt for the same reason as EntryIn.amount: 2500.0 is not
     # money, and coercing it into 2500 is how rounding bugs are born.
@@ -101,6 +113,14 @@ class ChargeCreate(BaseModel):
 
 
 class WithdrawalCreate(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {"account_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6", "amount": 50000}
+            ]
+        }
+    )
+
     account_id: uuid.UUID
     # Minor units, StrictInt for the same reason as everywhere else in this file.
     amount: StrictInt = Field(gt=0)
@@ -154,6 +174,18 @@ class WebhookIn(BaseModel):
     redelivery -- which is exactly what makes redelivery detectable.
     """
 
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "id": "evt_1a2b3c4d5e6f",
+                    "type": "charge.succeeded",
+                    "data": {"attempt_ref": "3fa85f64-5717-4562-b3fc-2c963f66afa6"},
+                }
+            ]
+        }
+    )
+
     id: str = Field(min_length=1, max_length=MAX_EVENT_ID_LENGTH)
     type: WebhookEventType
     data: WebhookData
@@ -186,6 +218,17 @@ class RefundCreate(BaseModel):
     charge because the caller is asserting something checkable about an account;
     here there is nothing to assert.
     """
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                # A partial refund. The payment stays 'succeeded'.
+                {"amount": 100000},
+                # And the full-refund form: no body at all means "whatever is left".
+                {},
+            ]
+        }
+    )
 
     # Minor units, StrictInt for the same reason as everywhere else in this file:
     # 2500.0 is not money, and coercing it into 2500 is how rounding bugs are born.

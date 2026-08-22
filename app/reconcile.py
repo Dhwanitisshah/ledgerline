@@ -111,11 +111,13 @@ from enum import StrEnum
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app import metrics
 from app.config import settings
 from app.idempotency import finalize_key, unfinished_key_for_payment
 from app.ledger import LedgerInvariantError, settlement_account_id, write_posting
 from app.locking import try_lock_payment_for_settlement
 from app.models import Payment, PaymentStatus
+from app.observability import configure_logging
 from app.outbox import record_payment_succeeded
 from app.payments import transition
 from app.processor import ProcessorAdapter
@@ -351,6 +353,12 @@ async def sweep_once(
         )
 
     report = SweepReport()
+    # Counted at discovery rather than at settlement: the question this answers is
+    # "how much stranded work is this sweep finding?", and a payment that turns out
+    # to be locked by another worker was still found by this one.
+    for _ in candidates:
+        metrics.observe_stuck_payment_found()
+
     for payment_id in candidates:
         # A fresh session per payment: its own connection, its own transaction, its
         # own commit. One payment's failure cannot take another's settlement with it.
@@ -470,9 +478,11 @@ async def _main() -> None:  # pragma: no cover - CLI
             await engine.dispose()
         return
 
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)-7s %(name)s: %(message)s"
-    )
+    # Structured, same as the web process. A worker whose logs are shaped
+    # differently from the API's is a worker whose logs get dropped by the ingester
+    # -- and these three are exactly the processes nobody is watching when they
+    # matter, so their output has to survive the pipeline unassisted.
+    configure_logging(log_format=settings.LOG_FORMAT, level=settings.LOG_LEVEL)
 
     # Only `lookup` is ever called on this, so the configured outcome and latency
     # are irrelevant. What matters is that it has the books.
