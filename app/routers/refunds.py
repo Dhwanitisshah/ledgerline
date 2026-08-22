@@ -90,7 +90,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.deps import get_processor, get_session, processor_books
+from app.deps import (
+    get_processor,
+    get_session,
+    processor_books,
+    reject_test_affordances_if_disabled,
+)
 from app.idempotency import (
     MAX_KEY_LENGTH,
     claim_key,
@@ -213,6 +218,10 @@ async def create_refund(
     * same key while the first attempt is still running -> 409.
     """
     body = payload or RefundCreate()
+
+    # Phase 7: same gate as the charge route, and checked before the claim so a
+    # refused request leaves the caller's key free.
+    reject_test_affordances_if_disabled(force_outcome=body.force_outcome)
 
     key = (idempotency_key or "").strip()
     if not key:

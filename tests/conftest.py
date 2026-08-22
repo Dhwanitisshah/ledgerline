@@ -12,8 +12,10 @@ import pytest_asyncio
 from httpx import ASGITransport, AsyncClient, Response
 from sqlalchemy import text
 
+from app import metrics
 from app.db import engine
 from app.main import app
+from app.middleware import limiter
 
 # TRUNCATE, not DELETE, and deliberately so: the append-only triggers reject
 # DELETE on the ledger tables, and TRUNCATE does not fire UPDATE/DELETE triggers.
@@ -37,6 +39,17 @@ _TRUNCATE_SQL = text(
 async def client() -> AsyncIterator[AsyncClient]:
     async with engine.begin() as conn:
         await conn.execute(_TRUNCATE_SQL)
+
+    # The Phase 7 rate limiter is a PROCESS global, so without this the suite
+    # accumulates requests across every test in one window and starts answering 429
+    # somewhere in the middle -- which is not a flaky test, it is the limiter working
+    # exactly as designed against a client that happens to be a test session.
+    #
+    # Reset rather than disable, so the middleware still runs on every request and a
+    # mistake in it still shows up here. The tests that are *about* limiting set
+    # their own limit; see tests/test_hardening.py.
+    limiter.reset()
+    metrics.reset()
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as async_client:

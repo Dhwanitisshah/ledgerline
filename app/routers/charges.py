@@ -170,7 +170,12 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.deps import get_processor, get_session, processor_books
+from app.deps import (
+    get_processor,
+    get_session,
+    processor_books,
+    reject_test_affordances_if_disabled,
+)
 from app.idempotency import (
     MAX_KEY_LENGTH,
     bind_payment,
@@ -346,6 +351,14 @@ async def create_charge(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Idempotency-Key must be at most {MAX_KEY_LENGTH} characters",
         )
+
+    # Phase 7: the fake processor's knobs are not reachable in production. Checked
+    # before the key is claimed, so a refused request consumes nothing.
+    reject_test_affordances_if_disabled(
+        force_outcome=payload.force_outcome,
+        force_latency_ms=payload.force_latency_ms,
+        force_crash_after_processor=payload.force_crash_after_processor,
+    )
 
     request_hash = request_fingerprint(
         account_id=payload.account_id, amount=payload.amount, currency=payload.currency

@@ -1,3 +1,4 @@
+# Keep the build context small and keep secrets out of the image.
 .venv
 __pycache__
 *.pyc
@@ -5,5 +6,10 @@ __pycache__
 .ruff_cache
 .env
 .git
+.gitattributes
 .github
 README.md
+tests
+scripts
+docker-compose.yml
+fly.toml

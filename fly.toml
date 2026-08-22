@@ -1,0 +1,106 @@
+# Ledgerline on Fly.io.
+#
+# Three process groups from ONE image. That is the important line in this file: the
+# API, the outbox publisher and the reconciler are the same build with different
+# commands, so a worker can never be running different code than the API that
+# writes the rows it consumes. Deploying a fix to the settlement flow deploys it to
+# the sweep that repairs the settlement flow, in the same release, always.
+#
+#   app         uvicorn                  -- serves HTTP
+#   publisher   python -m app.publisher  -- drains outbox_events (Phase 5b)
+#   reconciler  python -m app.reconcile  -- settles stuck payments (Phase 5a)
+#
+# The drift detector (Phase 6) is deliberately NOT a process group. It is a
+# report, not a loop: it terminates, it writes nothing, and running it on a
+# permanent machine would burn a VM to do nothing between passes. Run it on a
+# schedule or by hand -- see the README.
+
+app = "ledgerline"
+primary_region = "bom"          # Mumbai; move this to wherever the database is.
+
+[build]
+  dockerfile = "Dockerfile"
+
+# Migrations run here, ONCE per deploy, before any new machine takes traffic and
+# before the old ones are replaced.
+#
+# This is the whole reason not to run `alembic upgrade head` from an entrypoint
+# script: with three process groups, an entrypoint would run the migration three
+# times concurrently on boot. Alembic takes a lock and would mostly survive that,
+# but "mostly survives a race we introduced on purpose" is not a deployment story.
+# A release command runs in one place, once, and a failure aborts the deploy with
+# the old version still serving.
+[deploy]
+  release_command = "alembic upgrade head"
+  strategy = "rolling"
+
+[env]
+  APP_ENV = "production"
+  LOG_FORMAT = "json"
+  LOG_LEVEL = "INFO"
+  # Explicit, though the Dockerfile and app/config.py both already default it off in
+  # production. Three independent places agreeing that the fake processor's crash
+  # knob is unreachable is not redundancy worth trimming -- it is the setting whose
+  # mistake lets a stranger strand payments.
+  ALLOW_TEST_AFFORDANCES = "false"
+  RATE_LIMIT_REQUESTS = "600"
+  RATE_LIMIT_WINDOW_SECONDS = "60"
+  # Workers poll; these bound how stale things get. Both are upper bounds on
+  # LATENCY, not on correctness -- an unpublished event and an unsettled payment are
+  # both durable while they wait.
+  OUTBOX_INTERVAL_SECONDS = "5"
+  RECONCILE_INTERVAL_SECONDS = "10"
+
+[processes]
+  app = "uvicorn app.main:app --host 0.0.0.0 --port 8000"
+  publisher = "python -m app.publisher"
+  reconciler = "python -m app.reconcile"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  # Only the API serves HTTP. Naming it here is what stops Fly routing traffic to a
+  # publisher machine, which has no listener and would simply time out.
+  processes = ["app"]
+
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  # Zero is correct for a portfolio deployment: nothing is lost by stopping, because
+  # every piece of state is in Postgres and the workers pick their queues back up
+  # from a table when they wake. The visible cost is a cold start on the first
+  # request after idle.
+  min_machines_running = 0
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 80
+    hard_limit = 120
+
+  # Readiness, not liveness. /ready checks the database, so a machine that cannot
+  # reach Postgres stops receiving traffic -- while /health stays dependency-free so
+  # that a database blip never convinces Fly to restart every machine at once. That
+  # distinction is why there are two endpoints; see app/main.py.
+  [[http_service.checks]]
+    interval = "15s"
+    timeout = "3s"
+    grace_period = "10s"
+    method = "GET"
+    path = "/ready"
+
+# The web machines. Small on purpose -- this is I/O bound on Postgres.
+[[vm]]
+  processes = ["app"]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+
+# The workers. Both are poll loops that sleep most of the time, so they get the
+# smallest machine Fly offers.
+#
+# They are NOT auto-stopped: a stopped reconciler is a stopped recovery mechanism,
+# and Phase 5a is explicit that durability buys the *ability* to recover while
+# something still has to perform it. A payment stranded at 3am should not wait for
+# somebody to send an HTTP request before anyone notices.
+[[vm]]
+  processes = ["publisher", "reconciler"]
+  size = "shared-cpu-1x"
+  memory = "256mb"

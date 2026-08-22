@@ -1,3 +1,4 @@
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.processor import ProcessorOutcome
@@ -7,6 +8,9 @@ from app.strategies import ChargeDurability, ClaimStrategy, WithdrawalGuard
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
+    # 'local' | 'ci' | 'staging' | 'production'. Phase 7 gives this teeth: it is
+    # what decides whether the fake processor's test knobs are reachable over HTTP
+    # and whether the deliberately-broken strategy paths may be selected at all.
     APP_ENV: str = "local"
     DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5433/ledgerline"
 
@@ -95,6 +99,103 @@ class Settings(BaseSettings):
     # this project, so `--once` terminates and an operator can predict what a run
     # costs.
     DRIFT_BATCH_SIZE: int = 500
+
+    # --- Hardening (Phase 7) --------------------------------------------------------
+    # Whether `force_outcome`, `force_latency_ms` and `force_crash_after_processor`
+    # are honoured on POST /charges and POST /charges/{id}/refund.
+    #
+    # None means "derive from APP_ENV", and deriving is the safe direction: a
+    # deployment that forgets to set this still refuses them, because the default
+    # falls out of APP_ENV=production rather than out of a boolean somebody had to
+    # remember. A stray `force_crash_after_processor: true` from a stranger would
+    # otherwise strand a payment in 'processing' on demand -- the exact state Phase
+    # 5a built a sweep to recover from, reachable by anyone with curl.
+    #
+    # Set it to true explicitly on a staging box where the smoke scripts should run
+    # against a real deployment. Setting it true in production is possible and is
+    # meant to feel like a decision.
+    ALLOW_TEST_AFFORDANCES: bool | None = None
+
+    # Requests per window per client. In-process and therefore per-machine; see
+    # app/ratelimit.py for the honest limits of that.
+    #
+    # 600/60s is 10 requests a second from one client. This started at 120 (2/s) and
+    # was raised after running the eight smoke scripts back to back tripped it --
+    # which is the useful kind of accident, because it showed the number was set for
+    # a threat model nobody has rather than for the traffic that actually exists. A
+    # limiter that refuses ordinary scripted use is one that gets disabled entirely,
+    # and a disabled limiter protects nothing. This still stops a flood dead while
+    # leaving legitimate integration work far below the ceiling.
+    RATE_LIMIT_REQUESTS: int = 600
+    RATE_LIMIT_WINDOW_SECONDS: int = 60
+    RATE_LIMIT_ENABLED: bool = True
+
+    # Comma-separated origins for CORS, or "" for none. Empty by default: this is an
+    # API with no browser client, and an allow-list that starts permissive is one
+    # nobody ever tightens.
+    CORS_ALLOW_ORIGINS: str = ""
+
+    # 'json' | 'text'. JSON in a deployment, where logs are ingested by a machine;
+    # text locally, where they are read by a person.
+    LOG_FORMAT: str = "text"
+    LOG_LEVEL: str = "INFO"
+
+    @property
+    def is_production(self) -> bool:
+        return self.APP_ENV.strip().lower() in {"production", "prod"}
+
+    @property
+    def test_affordances_allowed(self) -> bool:
+        """Whether the fake processor's knobs may be driven from a request body."""
+        if self.ALLOW_TEST_AFFORDANCES is not None:
+            return self.ALLOW_TEST_AFFORDANCES
+        return not self.is_production
+
+    @property
+    def cors_origins(self) -> list[str]:
+        return [origin.strip() for origin in self.CORS_ALLOW_ORIGINS.split(",") if origin.strip()]
+
+    @model_validator(mode="after")
+    def _refuse_broken_paths_in_production(self) -> "Settings":
+        """The preserved-broken paths are not deployable, and this says so at startup.
+
+        Phases 4 and 5a keep their naive implementations in the tree on purpose, so
+        the before/after stays a measurement rather than a memory. That is worth a
+        lot in a repository and worth nothing in production, where selecting one
+        means running code the project itself documents as wrong -- a double-charge
+        under concurrency, or a charge that loses a charged card.
+
+        Failing at startup rather than at the first request is deliberate: a
+        misconfigured deployment should never come up healthy and then be wrong
+        under load. This is the one setting whose mistake is unrecoverable, since by
+        the time you notice, the money has moved.
+        """
+        if not self.is_production:
+            return self
+
+        broken = {
+            "IDEMPOTENCY_CLAIM_STRATEGY": (
+                self.IDEMPOTENCY_CLAIM_STRATEGY, ClaimStrategy.NAIVE
+            ),
+            "WITHDRAWAL_GUARD": (self.WITHDRAWAL_GUARD, WithdrawalGuard.NAIVE),
+            "CHARGE_DURABILITY": (self.CHARGE_DURABILITY, ChargeDurability.SINGLE_TXN),
+        }
+        selected = [name for name, (value, naive) in broken.items() if value is naive]
+        if selected:
+            raise ValueError(
+                f"refusing to start: {', '.join(selected)} selects a deliberately "
+                "broken implementation, and APP_ENV=production. These paths exist so "
+                "the bug can be reproduced on demand (see app/strategies.py); they "
+                "are not production paths and never were."
+            )
+
+        if self.NAIVE_RACE_WINDOW_MS > 0:
+            raise ValueError(
+                "refusing to start: NAIVE_RACE_WINDOW_MS widens a race window on "
+                "purpose and APP_ENV=production"
+            )
+
+        return self
 
 
 settings = Settings()

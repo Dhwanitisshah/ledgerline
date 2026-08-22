@@ -33,7 +33,6 @@ from app.publisher import (
     publish_once,
 )
 from app.reconcile import sweep_once
-from app.routers.charges import SimulatedCrash
 from tests.conftest import (
     count_rows,
     create_account,
@@ -69,10 +68,20 @@ async def sweep():
 
 
 async def crash_a_charge(client: AsyncClient, account: str, **overrides: object) -> None:
-    with pytest.raises(SimulatedCrash):
-        await post_charge(
-            client, account, AMOUNT, key=KEY, force_crash_after_processor=True, **overrides
-        )
+    """Abandon a charge at the fatal instant.
+
+    Phase 7 changed what this looks like from outside. The crash used to propagate
+    out of the ASGI transport and be caught here with ``pytest.raises``; now
+    ``AccessLogMiddleware`` catches it, logs it with a request id, and returns a bare
+    500 -- which is what a real client always saw and what production must do rather
+    than leaking a traceback onto the wire. So this asserts the 500, which is a
+    strictly better assertion: it is the observable behaviour rather than an artifact
+    of the test transport.
+    """
+    response = await post_charge(
+        client, account, AMOUNT, key=KEY, force_crash_after_processor=True, **overrides
+    )
+    assert response.status_code == 500, response.text
 
 
 async def only_event() -> dict:
@@ -190,8 +199,11 @@ async def test_the_event_and_the_posting_live_or_die_together(
     monkeypatch.setattr("app.routers.charges._complete", die)
 
     account = await create_account(client, "Customer")
-    with pytest.raises(SettlementDied):
-        await post_charge(client, account, AMOUNT, key=KEY)
+    # A 500, not a raised exception: the Phase 7 middleware turns any unhandled
+    # error into a clean response. What the transaction did is unchanged, which is
+    # what this test is actually about.
+    died = await post_charge(client, account, AMOUNT, key=KEY)
+    assert died.status_code == 500, died.text
 
     # Transaction A committed, so the attempt survives -- that is Phase 5a.
     status = await scalar("SELECT status::text FROM payments")

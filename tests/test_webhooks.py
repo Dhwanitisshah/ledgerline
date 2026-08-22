@@ -19,7 +19,6 @@ Two things are under test here and they are independent:
 import asyncio
 import uuid
 
-import pytest
 from httpx import AsyncClient, Response
 
 from app.db import async_session
@@ -27,7 +26,6 @@ from app.deps import processor_books
 from app.models import PaymentStatus
 from app.processor import FakeProcessor
 from app.reconcile import ReconcileOutcome, sweep_once
-from app.routers.charges import SimulatedCrash
 from tests.conftest import (
     count_rows,
     create_account,
@@ -57,11 +55,20 @@ async def send_webhook(client: AsyncClient, body: dict) -> Response:
 async def crash_a_charge(
     client: AsyncClient, account: str, *, key: str = KEY, **overrides: object
 ) -> str:
-    """Abandon a charge at the fatal instant, and return the stranded payment id."""
-    with pytest.raises(SimulatedCrash):
-        await post_charge(
-            client, account, AMOUNT, key=key, force_crash_after_processor=True, **overrides
-        )
+    """Abandon a charge at the fatal instant, and return the stranded payment id.
+
+    Phase 7 changed what this looks like from outside. The crash used to propagate
+    out of the ASGI transport and be caught here with ``pytest.raises``; now
+    ``AccessLogMiddleware`` catches it, logs it with a request id, and returns a bare
+    500 -- which is what a real client always saw and what production must do rather
+    than leaking a traceback onto the wire. So this asserts the 500, which is a
+    strictly better assertion: it is the observable behaviour rather than an artifact
+    of the test transport.
+    """
+    response = await post_charge(
+        client, account, AMOUNT, key=key, force_crash_after_processor=True, **overrides
+    )
+    assert response.status_code == 500, response.text
     return str(await scalar("SELECT id FROM payments ORDER BY created_at DESC LIMIT 1"))
 
 

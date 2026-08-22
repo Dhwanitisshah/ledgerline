@@ -115,3 +115,35 @@ jobs:
       - name: Drift detector --json runs and exits
         timeout-minutes: 2
         run: python -m app.drift --json
+
+      # Phase 7. The image is what actually gets deployed, so a build that only
+      # ever happens on Fly is a build that breaks on Fly. This catches a bad
+      # Dockerfile here, where it costs a red check instead of a failed release.
+      - name: Docker image builds
+        run: docker build -t ledgerline:ci .
+
+      # And that the image is what it claims: the right Python, a non-root user,
+      # and production defaults baked in. The Python check is not ceremony -- the
+      # Dockerfile said 3.12 until Phase 7 while CI tested on 3.13, so the
+      # container had never run the interpreter the suite was green against.
+      - name: Image runs the pinned Python, unprivileged, hardened
+        run: |
+          docker run --rm ledgerline:ci python -c "
+          import os, sys
+          assert sys.version_info[:2] == (3, 13), sys.version
+          assert os.getuid() != 0, 'must not run as root'
+          from app.config import settings
+          assert settings.is_production, settings.APP_ENV
+          assert settings.test_affordances_allowed is False
+          print('image ok:', sys.version.split()[0], 'uid', os.getuid())
+          "
+
+      # The production guard, exercised end to end: selecting a deliberately broken
+      # path must abort startup rather than come up healthy and be wrong under load.
+      - name: Production refuses to start on a broken path
+        run: |
+          if docker run --rm -e IDEMPOTENCY_CLAIM_STRATEGY=naive ledgerline:ci python -c "import app.config" 2>/dev/null; then
+            echo "FAIL: production accepted a deliberately broken strategy" >&2
+            exit 1
+          fi
+          echo "production correctly refused to start"
