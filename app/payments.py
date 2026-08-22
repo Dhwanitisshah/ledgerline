@@ -3,7 +3,7 @@
 A payment's status is not a string that code assigns. It is a position in a graph
 with a fixed set of legal moves::
 
-    created ──▶ processing ──┬──▶ succeeded
+    created ──▶ processing ──┬──▶ succeeded ──▶ refunded
                              └──▶ failed
 
 Every other move is illegal, and illegal means :class:`IllegalTransitionError` --
@@ -12,10 +12,27 @@ at all: ``payment.status = "succeeded"`` is one keystroke, can be written from
 anywhere, and looks entirely reasonable at a glance. Routing every change through
 :func:`transition` makes the graph the only way to move.
 
-``refunded`` appears in the enum because the column type has to know about it
-before Phase 6 can use it, but nothing transitions into it yet. Its row in
-:data:`ALLOWED_TRANSITIONS` is deliberately unreachable, and there is a test that
-says so, so "we forgot to wire up refunds" cannot pass for "refunds work".
+## What Phase 6 added, and what it deliberately did not
+
+``succeeded -> refunded`` is now legal, and that is the *only* new edge. Read the
+graph carefully, because the interesting content is in what is missing from it:
+
+* **There is no ``partially_refunded`` state.** A payment with some of its money
+  returned is still partly live, so it stays ``succeeded``. Only a refund that
+  brings the total to the full charge moves it to ``refunded``. The alternative --
+  a status per degree of refundedness -- would encode an *amount* in a state
+  machine, and the amount already has a home: a SUM over the ``refunds`` table.
+  This is the same decision as having no ``balance`` column, applied a third time.
+* **``refunded`` is terminal.** A fully refunded payment does not move again. There
+  is no un-refund, because reversing a reversal is a new charge and not a state
+  change.
+* **``failed`` is still terminal**, so a failed payment cannot be refunded -- which
+  falls out of the graph rather than needing a rule of its own. There was never
+  any money to send back.
+
+The practical effect: a partial refund does not call :func:`transition` at all. It
+writes a ``refunds`` row and a reversing posting, and leaves this column exactly as
+it found it. Only the final one transitions.
 """
 
 from collections.abc import Mapping
@@ -31,12 +48,16 @@ ALLOWED_TRANSITIONS: Mapping[PaymentStatus, frozenset[PaymentStatus]] = MappingP
     {
         PaymentStatus.CREATED: frozenset({PaymentStatus.PROCESSING}),
         PaymentStatus.PROCESSING: frozenset({PaymentStatus.SUCCEEDED, PaymentStatus.FAILED}),
-        # Terminal states. Phase 6 will add SUCCEEDED -> REFUNDED; until then a
-        # settled payment does not move, and neither does a failed one. Note that
-        # this makes retrying a failed charge impossible by design: a retry is a
-        # new payment, not a resurrection of the old one.
-        PaymentStatus.SUCCEEDED: frozenset(),
+        # Phase 6. A settled charge can be sent back -- but only when the refunds
+        # total the WHOLE amount; a partial refund leaves the payment here. The
+        # decision of when to make this move lives in app/refunds.py, because it is
+        # arithmetic against the refunds table rather than a property of the graph.
+        PaymentStatus.SUCCEEDED: frozenset({PaymentStatus.REFUNDED}),
+        # Terminal. A retry of a failed charge is a new payment, not a resurrection
+        # of the old one -- and a failed charge cannot be refunded, which falls out
+        # of this empty set rather than needing a rule written somewhere else.
         PaymentStatus.FAILED: frozenset(),
+        # Terminal. Reversing a reversal is a new charge, not a state change.
         PaymentStatus.REFUNDED: frozenset(),
     }
 )

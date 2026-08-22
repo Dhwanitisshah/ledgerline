@@ -172,6 +172,60 @@ class WebhookOut(BaseModel):
     outcome: str
 
 
+class RefundCreate(BaseModel):
+    """The body of ``POST /charges/{id}/refund``.
+
+    ``amount`` is optional, and omitting it means **refund whatever is left** --
+    the whole charge for an untouched payment, the remainder for a partly refunded
+    one. That default is deliberate: refunding in full is the common case, and a
+    caller who does not have to compute an amount cannot compute it wrongly.
+
+    There is no ``currency`` field. A refund is denominated in the charge's
+    currency by definition, and offering the caller somewhere to type a different
+    one would only create a mismatch to validate. Phase 2 accepts a currency on a
+    charge because the caller is asserting something checkable about an account;
+    here there is nothing to assert.
+    """
+
+    # Minor units, StrictInt for the same reason as everywhere else in this file:
+    # 2500.0 is not money, and coercing it into 2500 is how rounding bugs are born.
+    amount: StrictInt | None = Field(default=None, gt=0)
+
+    # --- Test affordance ----------------------------------------------------------
+    # Forces the fake processor to decline this reversal, exactly as `force_outcome`
+    # does for a charge. Real processors refuse refunds -- a charge too old, a closed
+    # card, an open dispute -- and a flow that cannot be shown handling a "no" has
+    # only ever been tested on the happy path.
+    force_outcome: ProcessorOutcome | None = None
+
+
+class RefundOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    payment_id: uuid.UUID
+    amount: int
+    currency: str
+    # 'succeeded' | 'failed' -- the refund's own outcome, not the payment's.
+    status: str
+    processor_ref: str | None
+    failure_reason: str | None
+    # The reversing posting. NULL unless the refund succeeded; this is the field
+    # that says whether any money actually went back.
+    ledger_transaction_id: uuid.UUID | None
+    created_at: datetime
+
+    # --- Where the payment now stands ---------------------------------------------
+    # Derived, never stored: `total_refunded` is a SUM over the refunds table and
+    # `payment_status` comes off the payment. They are returned together because a
+    # caller that has just refunded almost always wants to know whether anything is
+    # left, and making them issue a second request to find out would invite them to
+    # cache the answer instead.
+    total_refunded: int
+    remaining_refundable: int
+    payment_status: PaymentStatus
+
+
 class ChargeOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

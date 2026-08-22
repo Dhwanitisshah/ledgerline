@@ -93,6 +93,48 @@ class ChargeResult:
         return self.outcome is ProcessorOutcome.SUCCESS
 
 
+@dataclass(frozen=True, slots=True)
+class RefundResult:
+    """The processor's answer for one reversal.
+
+    Structurally identical to :class:`ChargeResult`, and a separate type anyway.
+    Collapsing them would save eight lines and cost the thing that matters here:
+    a function signature saying ``-> ChargeResult`` for an operation that moves
+    money the other way is a small lie that a reader has to hold in their head
+    forever. The processor's two operations are different operations.
+    """
+
+    outcome: ProcessorOutcome
+    processor_ref: str
+    failure_reason: str | None = None
+
+    @property
+    def succeeded(self) -> bool:
+        return self.outcome is ProcessorOutcome.SUCCESS
+
+
+@dataclass(frozen=True, slots=True)
+class RecordedRefund:
+    """One reversal as the processor's books hold it, including its reference.
+
+    Distinct from :class:`RefundResult` because it answers a different question.
+    ``RefundResult`` is "what did you just do for me?"; this is "what is on file?",
+    and the difference that matters is ``attempt_ref`` -- the drift job has to
+    match the processor's reversals against ours *by reference*, and a result that
+    does not carry one cannot be matched to anything.
+    """
+
+    attempt_ref: uuid.UUID
+    processor_ref: str
+    amount: int
+    outcome: ProcessorOutcome
+    failure_reason: str | None = None
+
+    @property
+    def succeeded(self) -> bool:
+        return self.outcome is ProcessorOutcome.SUCCESS
+
+
 class ProcessorAdapter(Protocol):
     """The seam. Two methods as of Phase 5a.
 
@@ -110,6 +152,17 @@ class ProcessorAdapter(Protocol):
     ) -> ChargeResult: ...
 
     async def lookup(self, attempt_ref: uuid.UUID) -> ChargeResult | None: ...
+
+    async def refund(
+        self,
+        *,
+        attempt_ref: uuid.UUID,
+        charge_ref: uuid.UUID,
+        amount: int,
+        currency: str,
+    ) -> RefundResult: ...
+
+    async def lookup_refund(self, attempt_ref: uuid.UUID) -> RefundResult | None: ...
 
 
 # --- The processor's own database ----------------------------------------------
@@ -131,6 +184,40 @@ _READ_CHARGE_SQL = text(
     SELECT processor_ref, outcome, failure_reason
     FROM processor_charges
     WHERE attempt_ref = :attempt_ref
+    """
+)
+
+_RECORD_REFUND_SQL = text(
+    """
+    INSERT INTO processor_refunds (
+        attempt_ref, charge_ref, processor_ref, amount, currency, outcome,
+        failure_reason
+    )
+    VALUES (
+        :attempt_ref, :charge_ref, :processor_ref, :amount, :currency, :outcome,
+        :failure_reason
+    )
+    ON CONFLICT (attempt_ref) DO NOTHING
+    """
+)
+
+_READ_REFUND_SQL = text(
+    """
+    SELECT processor_ref, outcome, failure_reason
+    FROM processor_refunds
+    WHERE attempt_ref = :attempt_ref
+    """
+)
+
+# Every reversal the processor has recorded against one charge. The drift job's
+# question -- "do your books and ours agree about what came back?" -- cannot be
+# asked without it, and it is deliberately the only bulk read the books expose.
+_LIST_REFUNDS_SQL = text(
+    """
+    SELECT attempt_ref, processor_ref, amount, outcome, failure_reason
+    FROM processor_refunds
+    WHERE charge_ref = :charge_ref
+    ORDER BY created_at
     """
 )
 
@@ -211,6 +298,87 @@ class ProcessorBooks:
             failure_reason=row.failure_reason,
         )
 
+    async def record_refund(
+        self,
+        *,
+        attempt_ref: uuid.UUID,
+        charge_ref: uuid.UUID,
+        processor_ref: str,
+        amount: int,
+        currency: str,
+        outcome: ProcessorOutcome,
+        failure_reason: str | None,
+    ) -> RefundResult:
+        """Write the reversal down and return what the books now say.
+
+        The same ``ON CONFLICT DO NOTHING`` then read as :meth:`record`, and it is
+        doing more work here than it does for a charge. A refund's ``attempt_ref``
+        is *derived* from the payment and the caller's idempotency key rather than
+        generated (see app/refunds.py), so a retry after a crash arrives with the
+        reference the first attempt used. This statement is what turns that into a
+        replay: nothing is written, and the original outcome is returned, so the
+        money goes back exactly once even though Ledgerline asked twice.
+        """
+        async with self._session_factory() as session:
+            await session.execute(
+                _RECORD_REFUND_SQL,
+                {
+                    "attempt_ref": attempt_ref,
+                    "charge_ref": charge_ref,
+                    "processor_ref": processor_ref,
+                    "amount": amount,
+                    "currency": currency,
+                    "outcome": outcome.value,
+                    "failure_reason": failure_reason,
+                },
+            )
+            row = (await session.execute(_READ_REFUND_SQL, {"attempt_ref": attempt_ref})).one()
+            # Committed on the processor's schedule and nobody else's, exactly as a
+            # charge is. By the time this returns, the reversal is a fact outside
+            # Ledgerline's control.
+            await session.commit()
+
+        return RefundResult(
+            outcome=ProcessorOutcome(row.outcome),
+            processor_ref=row.processor_ref,
+            failure_reason=row.failure_reason,
+        )
+
+    async def find_refund(self, attempt_ref: uuid.UUID) -> RefundResult | None:
+        """What the processor knows about one reversal, or None if it never saw it."""
+        async with self._session_factory() as session:
+            row = (await session.execute(_READ_REFUND_SQL, {"attempt_ref": attempt_ref})).first()
+
+        if row is None:
+            return None
+
+        return RefundResult(
+            outcome=ProcessorOutcome(row.outcome),
+            processor_ref=row.processor_ref,
+            failure_reason=row.failure_reason,
+        )
+
+    async def refunds_for(self, charge_ref: uuid.UUID) -> list[RecordedRefund]:
+        """Every reversal the processor has against one charge.
+
+        Exists for the drift job, which has to compare two sets rather than two
+        rows: "which refunds does each side think happened, and do they agree about
+        the amounts?". A real processor exposes this as a list endpoint on the
+        charge, which is the shape this deliberately mirrors.
+        """
+        async with self._session_factory() as session:
+            rows = await session.execute(_LIST_REFUNDS_SQL, {"charge_ref": charge_ref})
+            return [
+                RecordedRefund(
+                    attempt_ref=row.attempt_ref,
+                    processor_ref=row.processor_ref,
+                    amount=int(row.amount),
+                    outcome=ProcessorOutcome(row.outcome),
+                    failure_reason=row.failure_reason,
+                )
+                for row in rows
+            ]
+
 
 class FakeProcessor:
     """A processor whose answer is decided by configuration, not by a network."""
@@ -277,3 +445,58 @@ class FakeProcessor:
         if self.books is None:
             return None
         return await self.books.find(attempt_ref)
+
+    async def refund(
+        self,
+        *,
+        attempt_ref: uuid.UUID,
+        charge_ref: uuid.UUID,
+        amount: int,
+        currency: str,
+    ) -> RefundResult:
+        """Reverse part or all of a charge, and remember having done so.
+
+        Uses the same configured ``outcome`` as :meth:`charge`, so a smoke script
+        or a test can force a *declined refund* with the same ``force_outcome``
+        knob it already uses to force a declined charge. Real processors do decline
+        reversals -- a charge too old to reverse, a closed card, a dispute already
+        open -- and a refund flow that cannot be shown handling a "no" is one that
+        has only been tested on the happy path.
+
+        Note what this method does **not** enforce: it will happily reverse more
+        than was charged, because a fake processor policing Ledgerline's invariants
+        would hide whether Ledgerline enforces them. The over-refund rule is ours,
+        and it is tested against our database, not against this object's manners.
+        """
+        if self.latency_ms > 0:
+            await asyncio.sleep(self.latency_ms / 1000)
+
+        processor_ref = f"fake_re_{uuid.uuid4().hex[:24]}"
+        failure_reason = (
+            "refund_declined (forced by the fake processor)"
+            if self.outcome is ProcessorOutcome.FAILURE
+            else None
+        )
+
+        if self.books is None:
+            return RefundResult(
+                outcome=self.outcome,
+                processor_ref=processor_ref,
+                failure_reason=failure_reason,
+            )
+
+        return await self.books.record_refund(
+            attempt_ref=attempt_ref,
+            charge_ref=charge_ref,
+            processor_ref=processor_ref,
+            amount=amount,
+            currency=currency,
+            outcome=self.outcome,
+            failure_reason=failure_reason,
+        )
+
+    async def lookup_refund(self, attempt_ref: uuid.UUID) -> RefundResult | None:
+        """Ask the processor what became of one reversal."""
+        if self.books is None:
+            return None
+        return await self.books.find_refund(attempt_ref)

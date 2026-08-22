@@ -117,11 +117,43 @@ def request_fingerprint(
     a 4xx the client can see and fix, where a false match would be a silent replay
     of the wrong charge.
     """
-    canonical = json.dumps(
-        {"account_id": str(account_id), "amount": amount, "currency": currency},
-        sort_keys=True,
-        separators=(",", ":"),
+    return _canonical_hash(
+        {"account_id": str(account_id), "amount": amount, "currency": currency}
     )
+
+
+def refund_fingerprint(*, payment_id: uuid.UUID, amount: int | None) -> str:
+    """Hash the fields that make one refund distinct from another (Phase 6).
+
+    The third caller of this machinery, and deliberately the *same* machinery: the
+    claim, the replay, the 422 on a reused key, and the TTL are all inherited from
+    :func:`claim_key` and :func:`finalize_key` unchanged. Only the fingerprint
+    differs, because what makes two refunds "the same refund" is a different pair
+    of fields than what makes two charges the same charge.
+
+    Covers ``payment_id`` and ``amount`` -- which charge is being reversed, and by
+    how much. ``amount`` is hashed **as the client sent it**, so ``null`` (meaning
+    "refund whatever is left") and an explicit amount equal to the remainder are
+    different fingerprints even when they resolve to the same number of paise.
+
+    That is the conservative direction to be wrong in, and it is the same call
+    :func:`request_fingerprint` makes about ``currency``. A false "different
+    payload" is a 422 the client can see and fix; a false match would silently
+    replay a refund the caller did not ask for. The caller owns the key and is
+    expected to resend the body it sent.
+    """
+    return _canonical_hash({"payment_id": str(payment_id), "amount": amount})
+
+
+def _canonical_hash(fields: dict[str, Any]) -> str:
+    """SHA-256 over a canonical JSON encoding. One encoding, one place.
+
+    Extracted when Phase 6 needed a second fingerprint. Sorted keys and tight
+    separators are what make the hash reproducible across processes and Python
+    versions; leaving each caller to remember that would be leaving each caller a
+    way to produce a hash that is right today and different after a refactor.
+    """
+    canonical = json.dumps(fields, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 

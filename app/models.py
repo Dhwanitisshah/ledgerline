@@ -35,11 +35,15 @@ class EntryDirection(StrEnum):
 class PaymentStatus(StrEnum):
     """Where a payment sits in its lifecycle.
 
-    ``REFUNDED`` is defined but unreachable: the legal-transition table in
-    ``app/payments.py`` has no move into it, and no endpoint produces one. It
-    exists here because the Postgres enum type has to carry every value the
-    column will ever hold, and widening an enum later is a migration this project
-    would rather write once. Phase 6 owns the refund flow.
+    ``REFUNDED`` was defined here in Phase 2 and left unreachable until Phase 6, so
+    that the Postgres enum carried every value the column would ever hold and the
+    widening migration was written once. That bet paid off exactly as intended: the
+    refund flow arrived without touching this type.
+
+    It means **fully** refunded. A payment with some of its money returned is still
+    partly live and stays ``SUCCEEDED``; see :class:`Payment`. That is what kept the
+    bet cheap -- had partial refunds needed their own status, the enum would have
+    had to widen after all.
     """
 
     CREATED = "created"
@@ -174,6 +178,14 @@ class Payment(Base):
     in ``app/reconcile.py`` resolves them against the processor's records rather
     than by guessing from a timestamp.
 
+    Phase 6 makes ``refunded`` reachable, and adds a rule worth reading twice:
+    **a partial refund does not change this status.** A payment that has had some
+    of its money returned is still partly live, so it stays ``succeeded`` until the
+    refunds total the full charge, at which point it moves to ``refunded``. The
+    consequence is that "how much has been refunded" is **not a column here** -- it
+    is a SUM over ``refunds``, exactly as a balance is a SUM over ``ledger_entries``
+    and for exactly the same reason. See :class:`Refund` and app/refunds.py.
+
     Still absent, on purpose: any column linking a payment to the outbox events it
     produced. Phase 5b emits those events and deliberately does not point back
     here -- see :class:`OutboxEvent`.
@@ -218,10 +230,13 @@ class Payment(Base):
 
     __table_args__ = (
         sa.CheckConstraint("amount > 0", name="ck_payments_amount_positive"),
-        # Exactly the succeeded payments have a posting. See migration 0003 for
-        # why this lives in the database rather than in the route.
+        # Exactly the payments that MOVED MONEY have a posting. See migration 0003
+        # for why this lives in the database rather than in the route, and 0007 for
+        # why Phase 6 had to widen it by exactly one status: a refunded payment
+        # keeps the posting from its original charge, so the Phase 2 form of this
+        # constraint made 'refunded' literally unstorable.
         sa.CheckConstraint(
-            "(status = 'succeeded') = (ledger_transaction_id IS NOT NULL)",
+            "(status IN ('succeeded', 'refunded')) = (ledger_transaction_id IS NOT NULL)",
             name="ck_payments_posting_matches_status",
         ),
     )
@@ -487,4 +502,120 @@ class WebhookEvent(Base):
     )
     received_at: Mapped[datetime] = mapped_column(
         sa.TIMESTAMP(timezone=True), nullable=False, server_default=sa.text("now()")
+    )
+
+
+class Refund(Base):
+    """Money going back, one row per attempt.
+
+    A payment may have many of these. What bounds them is the Phase 6 invariant:
+
+        **the succeeded refunds for one payment never total more than it was
+        charged.**
+
+    That rule is enforced in three places, deliberately, because they fail
+    differently:
+
+    1. ``app/refunds.py`` checks it inside the transaction, against a SUM read back
+       from the database, so the route can answer with a clean 4xx.
+    2. ``app/locking.py`` takes ``SELECT ... FOR UPDATE`` on the payment first, so
+       two simultaneous refunds cannot both read a sum that omits the other -- the
+       Phase 4 overdraw race, which a refund is a perfect instance of.
+    3. A **trigger** installed by migration 0007 repeats both of those at the
+       database, taking the lock itself. That is the one that holds when the caller
+       is psql, or a future code path that forgets step 2.
+
+    Note what is absent, and that it is the same absence as ``accounts.balance``:
+    there is no ``refunded_amount`` column on ``payments``. How much has come back
+    is a SUM over these rows. A stored total is a cached number that has to be kept
+    in step with the rows that justify it, and the two drift the moment anything
+    goes wrong.
+
+    A refund is decided inside a single transaction, so unlike a payment it has no
+    ``created``/``processing`` states and does not share ``payment_status``. Its
+    reversing posting is an ordinary balanced two-legged posting -- Phase 1's
+    invariants, unchanged -- with the charge's legs the other way round.
+    """
+
+    __tablename__ = "refunds"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        sa.Uuid,
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=sa.text("gen_random_uuid()"),
+    )
+    payment_id: Mapped[uuid.UUID] = mapped_column(
+        sa.Uuid, sa.ForeignKey("payments.id"), nullable=False, index=True
+    )
+    # BIGINT minor units. A partial refund is a smaller number here and nothing
+    # else -- "partial" is a comparison against the charge, not a property of the
+    # refund.
+    amount: Mapped[int] = mapped_column(sa.BigInteger, nullable=False)
+    currency: Mapped[str] = mapped_column(sa.CHAR(3), nullable=False)
+    # 'succeeded' | 'failed'.
+    status: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    processor_ref: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    failure_reason: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    # The reversing posting. NULL exactly when the refund did not succeed.
+    ledger_transaction_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid, sa.ForeignKey("ledger_transactions.id"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        sa.TIMESTAMP(timezone=True), nullable=False, server_default=sa.text("now()")
+    )
+
+    __table_args__ = (
+        sa.CheckConstraint("amount > 0", name="ck_refunds_amount_positive"),
+        sa.CheckConstraint("status IN ('succeeded', 'failed')", name="ck_refunds_status"),
+        sa.CheckConstraint(
+            "(status = 'succeeded') = (ledger_transaction_id IS NOT NULL)",
+            name="ck_refunds_posting_matches_status",
+        ),
+    )
+
+
+class ProcessorRefund(Base):
+    """**Not Ledgerline's data.** The fake processor's record of a reversal.
+
+    Everything :class:`ProcessorCharge` says applies here without amendment: it is
+    somebody else's system, it is written on its own session in its own
+    transaction, nothing may join against it, and the only sanctioned reader is
+    ``ProcessorAdapter``.
+
+    ``attempt_ref`` is the processor-side idempotency key for one refund, and Phase
+    6 makes it **derived rather than generated** -- ``uuid5`` over the payment id
+    and the caller's ``Idempotency-Key``. That single choice is why refunds do not
+    need the two-transaction split Phase 5a built for charges. The charge needed it
+    because its attempt reference existed only in a Python variable until the
+    payment row committed, so a crash made the attempt unaskable-about. A derived
+    reference can be recomputed from the retry itself, so it survives a crash
+    without ever having been stored, and the processor's own idempotency turns the
+    retry into a replay instead of a second reversal.
+
+    ``charge_ref`` is the reversed charge's ``attempt_ref``, so the processor's two
+    tables can be related to each other by anyone reading them -- including the
+    drift job in ``app/drift.py``, which asks "does your side agree with ours?" and
+    needs both halves to do it.
+    """
+
+    __tablename__ = "processor_refunds"
+
+    attempt_ref: Mapped[uuid.UUID] = mapped_column(sa.Uuid, primary_key=True)
+    charge_ref: Mapped[uuid.UUID] = mapped_column(sa.Uuid, nullable=False, index=True)
+    processor_ref: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    amount: Mapped[int] = mapped_column(sa.BigInteger, nullable=False)
+    currency: Mapped[str] = mapped_column(sa.CHAR(3), nullable=False)
+    # 'success' | 'failure' -- the processor's vocabulary, not ours.
+    outcome: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    failure_reason: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        sa.TIMESTAMP(timezone=True), nullable=False, server_default=sa.text("now()")
+    )
+
+    __table_args__ = (
+        sa.CheckConstraint(
+            "outcome IN ('success', 'failure')", name="ck_processor_refunds_outcome"
+        ),
+        sa.CheckConstraint("amount > 0", name="ck_processor_refunds_amount_positive"),
     )

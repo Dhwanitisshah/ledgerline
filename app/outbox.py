@@ -73,7 +73,7 @@ from sqlalchemy import text
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Payment
+from app.models import Payment, Refund
 
 #: The only event type Phase 5b emits. Named for the fact rather than for the
 #: caller -- ``payment.succeeded`` is true whether the charge route, the sweep or
@@ -81,6 +81,16 @@ from app.models import Payment
 #: which. All three emit this identical event through
 #: :func:`record_payment_succeeded`.
 PAYMENT_SUCCEEDED = "payment.succeeded"
+
+#: Emitted when money goes back, in the transaction that sends it (Phase 6).
+#: Emitted for a PARTIAL refund as well as a full one, and the payload carries the
+#: numbers a consumer needs to tell them apart -- ``amount`` for this reversal,
+#: ``total_refunded`` and ``remaining_refundable`` for where the payment now
+#: stands. A consumer that only cares about "is this charge fully reversed?" reads
+#: ``payment_status``; one running a refund ledger of its own reads ``amount``.
+#: Splitting this into two event types would have made every consumer branch on
+#: something Ledgerline already knows.
+PAYMENT_REFUNDED = "payment.refunded"
 
 _INSERT_EVENT_SQL = text(
     """
@@ -211,6 +221,49 @@ async def record_payment_succeeded(session: AsyncSession, payment: Payment) -> u
                 None
                 if payment.ledger_transaction_id is None
                 else str(payment.ledger_transaction_id)
+            ),
+        },
+    )
+
+
+async def record_payment_refunded(
+    session: AsyncSession, payment: Payment, refund: Refund, *, total_refunded: int
+) -> uuid.UUID:
+    """Emit ``payment.refunded`` for a reversal whose posting is in this transaction.
+
+    Same contract as :func:`record_payment_succeeded` and for the same reason: the
+    row is written beside the reversing posting, in the settlement transaction, so
+    the event exists if and only if the money actually went back. A refund that
+    rolls back takes its announcement with it.
+
+    ``total_refunded`` is passed in rather than re-queried because the caller has
+    just computed it under the payment lock, and reading it again here would be a
+    second answer to a question that already has one -- with a window between them
+    in which they could differ.
+    """
+    return await record_event(
+        session,
+        PAYMENT_REFUNDED,
+        {
+            "payment_id": str(payment.id),
+            "refund_id": str(refund.id),
+            "account_id": str(payment.account_id),
+            # This reversal, in minor units. NOT the running total -- see below.
+            "amount": refund.amount,
+            "currency": refund.currency,
+            "charged": payment.amount,
+            # Where the payment stands after this reversal. Both are derived from
+            # the refunds table rather than stored anywhere, which is why they are
+            # computed once, under the lock, and carried here.
+            "total_refunded": total_refunded,
+            "remaining_refundable": payment.amount - total_refunded,
+            # 'succeeded' while partly refundable, 'refunded' once nothing is left.
+            "payment_status": str(payment.status),
+            "processor_ref": refund.processor_ref,
+            "ledger_transaction_id": (
+                None
+                if refund.ledger_transaction_id is None
+                else str(refund.ledger_transaction_id)
             ),
         },
     )

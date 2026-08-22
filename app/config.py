@@ -83,5 +83,18 @@ class Settings(BaseSettings):
     # the money and is not at risk while it waits.
     OUTBOX_INTERVAL_SECONDS: int = 5
 
+    # --- Drift detection (Phase 6) ------------------------------------------------
+    # How settled a payment must be before the drift job will compare it against the
+    # processor's books. This is not a performance knob -- it is what stops the job
+    # reporting normal in-flight work as a discrepancy. A charge mid-settlement
+    # legitimately exists on one side and not yet the other, and a job that shouted
+    # about that would be a job nobody reads.
+    DRIFT_GRACE_SECONDS: int = 60
+
+    # Most payments one drift pass will examine. Bounded like every other pass in
+    # this project, so `--once` terminates and an operator can predict what a run
+    # costs.
+    DRIFT_BATCH_SIZE: int = 500
+
 
 settings = Settings()

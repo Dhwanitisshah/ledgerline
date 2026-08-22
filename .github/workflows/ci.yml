@@ -66,13 +66,13 @@ jobs:
         run: alembic upgrade head
 
       # A down-migration nobody runs is a down-migration that does not work. This
-      # round-trips the newest revision -- down to 0005, back up to head -- so a
+      # round-trips the newest revision -- down one, back up to head -- so a
       # downgrade() that drops a table it never created, or forgets an index, is a
       # red build rather than a discovery made during a rollback at 3am. Safe to run
       # before the suite: the tests TRUNCATE everything they touch anyway.
       - name: Down-migration round-trips
         run: |
-          alembic downgrade 0005
+          alembic downgrade 0006
           alembic upgrade head
 
       - name: Lint
@@ -103,3 +103,15 @@ jobs:
       - name: Publisher --status runs and exits
         timeout-minutes: 2
         run: python -m app.publisher --status
+
+      # The Phase 6 drift job. Bounded like the others, and note what it is NOT:
+      # it exits 0 even when it finds drift, because drift is a thing to read
+      # rather than a thing that failed. A red build for a condition CI cannot fix
+      # is how a report ends up disabled.
+      - name: Drift detector runs and exits
+        timeout-minutes: 2
+        run: python -m app.drift --once
+
+      - name: Drift detector --json runs and exits
+        timeout-minutes: 2
+        run: python -m app.drift --json

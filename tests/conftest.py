@@ -27,9 +27,9 @@ from app.main import app
 # consumer that remembered yesterday's deliveries would make every event in the
 # next test look like a duplicate that had already been handled.
 _TRUNCATE_SQL = text(
-    "TRUNCATE TABLE ledger_entries, ledger_transactions, payments, "
-    "idempotency_keys, processor_charges, outbox_events, event_deliveries, "
-    "webhook_events, accounts RESTART IDENTITY CASCADE"
+    "TRUNCATE TABLE ledger_entries, ledger_transactions, refunds, payments, "
+    "idempotency_keys, processor_charges, processor_refunds, outbox_events, "
+    "event_deliveries, webhook_events, accounts RESTART IDENTITY CASCADE"
 )
 
 
@@ -119,3 +119,28 @@ async def create_charge(
     response = await post_charge(client, account_id, amount, key=key, **overrides)
     assert response.status_code == 201, response.text
     return response.json()
+
+
+async def refund_charge(
+    client: AsyncClient,
+    payment_id: str,
+    amount: int | None = None,
+    *,
+    key: str | None = None,
+    **overrides: object,
+) -> Response:
+    """POST a refund and return the raw response, asserting nothing.
+
+    Raw rather than parsed for the same reason as ``post_charge``: the idempotency
+    tests compare response bytes, and ``response.json()`` would throw that
+    comparison away. ``amount=None`` sends an empty body, which means "refund
+    whatever is still refundable".
+    """
+    body: dict[str, object] = {}
+    if amount is not None:
+        body["amount"] = amount
+    body.update(overrides)
+
+    return await client.post(
+        f"/charges/{payment_id}/refund", json=body, headers=idempotency_headers(key)
+    )

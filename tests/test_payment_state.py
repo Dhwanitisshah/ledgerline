@@ -88,18 +88,47 @@ def test_an_illegal_transition_leaves_the_payment_untouched() -> None:
 
 
 def test_terminal_states_have_no_way_out() -> None:
-    for terminal in (PaymentStatus.SUCCEEDED, PaymentStatus.FAILED, PaymentStatus.REFUNDED):
+    """Phase 6 removed SUCCEEDED from this list, and only SUCCEEDED.
+
+    A failed charge is not retried in place -- a retry is a new payment. A fully
+    refunded one does not move either: reversing a reversal is a new charge, not a
+    state change.
+    """
+    for terminal in (PaymentStatus.FAILED, PaymentStatus.REFUNDED):
         assert ALLOWED_TRANSITIONS[terminal] == frozenset()
 
 
-def test_nothing_transitions_into_refunded_yet() -> None:
-    """'refunded' exists in the enum for Phase 6 and is unreachable until then.
+def test_refunded_is_reachable_from_succeeded_and_from_nowhere_else() -> None:
+    """The Phase 6 edge, and the only one.
 
-    If a refund flow is ever added without updating the transition table, this is
-    the test that fails -- which is the correct place to notice.
+    This test is the inverse of the one it replaced. Through Phases 2-5 it asserted
+    that nothing transitioned into 'refunded', so that shipping a refund flow
+    without updating the table would fail loudly. Now it asserts the edge exists and
+    that exactly one state has it -- so that a later phase cannot quietly make a
+    failed or still-processing payment refundable by widening the table instead of
+    thinking about it.
     """
-    for allowed in ALLOWED_TRANSITIONS.values():
-        assert PaymentStatus.REFUNDED not in allowed
+    assert PaymentStatus.REFUNDED in ALLOWED_TRANSITIONS[PaymentStatus.SUCCEEDED]
+
+    sources = {
+        source
+        for source, allowed in ALLOWED_TRANSITIONS.items()
+        if PaymentStatus.REFUNDED in allowed
+    }
+    assert sources == {PaymentStatus.SUCCEEDED}
+
+
+def test_a_failed_payment_cannot_be_refunded() -> None:
+    """There was never any money to send back, and the graph is where that lives.
+
+    The refund route rejects this before the state machine is reached, so the caller
+    gets a sentence rather than an exception -- but the rule itself is here, in the
+    empty transition set, rather than duplicated as a condition in a route.
+    """
+    payment = make_payment(PaymentStatus.FAILED)
+    with pytest.raises(IllegalTransitionError):
+        transition(payment, PaymentStatus.REFUNDED)
+    assert payment.status is PaymentStatus.FAILED
 
 
 def test_can_transition_agrees_with_transition() -> None:

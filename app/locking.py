@@ -75,6 +75,23 @@ _LOCK_ACCOUNT_SQL = text("SELECT id FROM accounts WHERE id = :account_id FOR UPD
 # are simply not returned, rather than making this one wait. The status predicate
 # is inside the locked statement on purpose -- checking 'is it still processing?'
 # before taking the lock would be the same check-then-act shape Phase 4 is about.
+# Plain FOR UPDATE, not SKIP LOCKED -- the opposite choice from the settlement lock
+# directly below, and the difference is the whole reason both exist.
+#
+# The reconciler is a queue worker: a payment another worker holds is not something
+# to wait for, it is something to leave alone. A refund is a *user request* that has
+# been promised an answer. Skipping would mean telling a caller "no" because someone
+# else happened to be refunding the same payment a millisecond earlier, when waiting
+# for a few milliseconds and then giving them a correct answer -- the money went
+# back, or there is not enough left -- is obviously better.
+#
+# The wait is bounded by one refund's transaction, which does include a processor
+# call. That is the cost, and it is the reason this lock is per payment rather than
+# anything wider: two refunds against different payments never meet here.
+_LOCK_PAYMENT_FOR_REFUND_SQL = text(
+    "SELECT id FROM payments WHERE id = :payment_id FOR UPDATE"
+)
+
 _LOCK_PAYMENT_FOR_SETTLEMENT_SQL = text(
     """
     SELECT id
@@ -141,4 +158,34 @@ async def try_lock_payment_for_settlement(
     result = await session.execute(
         _LOCK_PAYMENT_FOR_SETTLEMENT_SQL, {"payment_id": payment_id}
     )
+    return result.first() is not None
+
+
+async def lock_payment_for_refund(session: AsyncSession, payment_id: uuid.UUID) -> bool:
+    """Take an exclusive row lock on one payment before refunding it. False if unknown.
+
+    Must be taken **before** the refunded total is read, and the ordering is the
+    entire point -- exactly as it is for ``lock_account_for_update`` and a
+    withdrawal's balance. A lock taken after the read protects nothing, because the
+    value it is meant to protect has already been copied into a Python variable.
+
+    Two refunds against one payment are precisely the Phase 4 overdraw race:
+
+        read refunded total -> decide there is room -> write a refund
+
+    Both requests read a true total, both apply a correct rule, and the total
+    stopped being true between the read and the write. From here to COMMIT no other
+    refund against this payment can read its total, so each one in turn sees a
+    figure that already includes every refund ahead of it.
+
+    Only the ``id`` is selected. The row is being used as a mutex, and reading
+    ``amount`` from it here would suggest the refundable balance lives on this row.
+    It does not: it is a SUM over ``refunds``, and always will be.
+
+    Note that this lock is a *convenience*, not the guarantee. Migration 0007's
+    trigger takes the same lock inside the database, so an over-refund is impossible
+    even from a caller that never came through this function. What the lock buys is
+    a clean 422 with a useful message instead of an integrity error.
+    """
+    result = await session.execute(_LOCK_PAYMENT_FOR_REFUND_SQL, {"payment_id": payment_id})
     return result.first() is not None
