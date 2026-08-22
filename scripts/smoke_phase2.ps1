@@ -8,6 +8,15 @@
 #
 # The forced failure is driven by "force_outcome": "failure" in the request body,
 # so this script never needs the server restarted under different env vars.
+#
+# Every POST /charges below carries an Idempotency-Key. That header did not exist
+# when this script was written -- Phase 3 added it and made it mandatory, so these
+# requests started answering 400 and this script had to be brought forward. Each
+# charge here is a distinct logical charge, so each gets its OWN fresh GUID; reusing
+# one would make the second request replay the first instead of running. That is
+# Phase 3's subject and not this one's -- see scripts\smoke_phase3.ps1 for the
+# script that actually exercises replay. Here the header is a requirement to
+# satisfy, nothing more.
 
 param(
     [string]$BaseUrl = "http://localhost:8000"
@@ -27,10 +36,14 @@ function Invoke-Api {
     param(
         [string]$Method,
         [string]$Path,
-        [string]$Body
+        [string]$Body,
+        [string]$IdempotencyKey
     )
 
     $curlArgs = @("-s", "-w", "`n%{http_code}", "-X", $Method, "$Base$Path")
+    if ($IdempotencyKey) {
+        $curlArgs += @("-H", "Idempotency-Key: $IdempotencyKey")
+    }
     if ($Body) {
         $bodyFile = Join-Path $TmpDir "body.json"
         [System.IO.File]::WriteAllText($bodyFile, $Body, $Utf8NoBom)
@@ -119,7 +132,8 @@ $chargeBody = @"
 }
 "@
 
-$charge = Invoke-Api -Method POST -Path "/charges" -Body $chargeBody
+$charge = Invoke-Api -Method POST -Path "/charges" -Body $chargeBody `
+    -IdempotencyKey ([guid]::NewGuid().ToString())
 Assert-Equal -Expected 201 -Actual $charge.Status -What "POST /charges status"
 Assert-Equal -Expected "succeeded" -Actual $charge.Body.status -What "payment status"
 Assert-NotNull -Actual $charge.Body.processor_ref -What "processor_ref"
@@ -152,7 +166,8 @@ $failBody = @"
 }
 "@
 
-$failed = Invoke-Api -Method POST -Path "/charges" -Body $failBody
+$failed = Invoke-Api -Method POST -Path "/charges" -Body $failBody `
+    -IdempotencyKey ([guid]::NewGuid().ToString())
 # 201, not 4xx: the payment resource was created and the outcome recorded. A
 # decline is a business result, not a failed request. Read `status` for which.
 Assert-Equal -Expected 201 -Actual $failed.Status -What "POST /charges (forced failure) status"
@@ -182,7 +197,8 @@ $slowBody = @"
 }
 "@
 
-$slow = Invoke-Api -Method POST -Path "/charges" -Body $slowBody
+$slow = Invoke-Api -Method POST -Path "/charges" -Body $slowBody `
+    -IdempotencyKey ([guid]::NewGuid().ToString())
 Assert-Equal -Expected 201 -Actual $slow.Status -What "POST /charges (250ms latency) status"
 Assert-Equal -Expected "succeeded" -Actual $slow.Body.status -What "payment status"
 
@@ -198,7 +214,12 @@ $ghostBody = @"
 }
 "@
 
-$ghost = Invoke-Api -Method POST -Path "/charges" -Body $ghostBody
+# A key here too, and it is load-bearing rather than ceremony: the route validates
+# the header BEFORE it looks the account up, so without one this would answer 400
+# and the assertion below would be passing for the wrong reason -- proving the key
+# check works rather than the unknown-account check.
+$ghost = Invoke-Api -Method POST -Path "/charges" -Body $ghostBody `
+    -IdempotencyKey ([guid]::NewGuid().ToString())
 Assert-Equal -Expected 404 -Actual $ghost.Status -What "POST /charges (unknown account) status"
 
 Write-Host "`nPhase 2 smoke: all checks passed.`n" -ForegroundColor Green
