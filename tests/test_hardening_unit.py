@@ -20,7 +20,7 @@ import sys
 import pytest
 
 from app import metrics
-from app.config import Settings
+from app.config import LOCAL_DATABASE_URL, Settings
 from app.observability import JsonFormatter, RequestIdFilter, new_request_id, request_id_var
 from app.ratelimit import FixedWindowLimiter
 from app.strategies import ChargeDurability, ClaimStrategy, WithdrawalGuard
@@ -306,10 +306,25 @@ def test_production_refuses_the_local_database_default() -> None:
 
     Inside a container that is not a fallback, it is a connection refused on every
     request, discovered by a customer rather than by the deploy.
+
+    The local default is passed *explicitly*. Letting it arrive via the field
+    default made this test depend on the ambient environment: pydantic-settings
+    reads DATABASE_URL from the environment ahead of the default, and CI exports it
+    on port 5432 (the service mapping) while the compose default is 5433. The guard
+    then correctly did not fire, and the test failed in CI while passing on every
+    developer machine -- where `.env` happens to hold the compose default and so
+    reproduced it by accident. The check under test compares a *value*, so supplying
+    that value is what actually exercises it.
     """
     with pytest.raises(Exception) as caught:
-        Settings(APP_ENV="production")
+        Settings(APP_ENV="production", DATABASE_URL=LOCAL_DATABASE_URL)
     assert "still the local compose default" in str(caught.value)
+
+    # And the default really is that value -- which is what makes the guard above
+    # reachable when a deployment supplies no database URL at all. Asserted here so
+    # that decoupling the test from the environment does not also stop it covering
+    # the "secret was never set" case it is named for.
+    assert Settings.model_fields["DATABASE_URL"].default == LOCAL_DATABASE_URL
 
     # An explicitly configured production URL is fine.
     ok = Settings(

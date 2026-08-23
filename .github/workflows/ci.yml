@@ -127,8 +127,18 @@ jobs:
       # Dockerfile said 3.12 until Phase 7 while CI tested on 3.13, so the
       # container had never run the interpreter the suite was green against.
       - name: Image runs the pinned Python, unprivileged, hardened
+        # DATABASE_URL is supplied for the same reason as in the step below, and it
+        # is not optional here. The image bakes in APP_ENV=production, `.env` is
+        # dockerignored, and production refuses the local compose default -- so
+        # `from app.config import settings` in a bare container aborts with
+        # "refusing to start: DATABASE_URL is still the local compose default"
+        # before reaching a single assertion. The value is a dummy: nothing here
+        # connects to a database, it only has to be a production-shaped URL that
+        # is not the local default.
         run: |
-          docker run --rm ledgerline:ci python -c "
+          docker run --rm \
+            -e DATABASE_URL="postgresql+asyncpg://u:p@db.internal:5432/ledgerline" \
+            ledgerline:ci python -c "
           import os, sys
           assert sys.version_info[:2] == (3, 13), sys.version
           assert os.getuid() != 0, 'must not run as root'
