@@ -201,5 +201,9 @@ Write-Host "found it. The outbox now holds two unpublished events (one charge, o
 Write-Host "refund) until the publisher worker drains them -- which is the check" -ForegroundColor DarkGray
 Write-Host "worth doing next:" -ForegroundColor DarkGray
 Write-Host "  curl.exe $Base/metrics | Select-String ledgerline_outbox_pending" -ForegroundColor DarkGray
-Write-Host "It should fall back to 0 within OUTBOX_INTERVAL_SECONDS. If it climbs" -ForegroundColor DarkGray
-Write-Host "and never falls, the publisher machine is not running.`n" -ForegroundColor DarkGray
+Write-Host "How fast it falls depends on how the publisher is deployed. Running as" -ForegroundColor DarkGray
+Write-Host "a loop (Fly process group), within OUTBOX_INTERVAL_SECONDS. Running on a" -ForegroundColor DarkGray
+Write-Host "schedule (the free tier's hourly GitHub Action), at the next pass -- or" -ForegroundColor DarkGray
+Write-Host "immediately, via Actions -> Workers -> Run workflow." -ForegroundColor DarkGray
+Write-Host "Either way the events are durable and waiting, not lost. What matters is" -ForegroundColor DarkGray
+Write-Host "that it FALLS: if it only ever climbs, no publisher is running at all.`n" -ForegroundColor DarkGray

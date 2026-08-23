@@ -1,0 +1,80 @@
+# Ledgerline on Render's free tier -- the WEB SERVICE ONLY.
+#
+# Two things are deliberately absent, and both absences are the reason this file
+# looks the way it does:
+#
+#   * No database. Render's free Postgres EXPIRES 30 days after creation and is
+#     then deleted, which is useless for a link meant to outlive a month. Postgres
+#     is Neon's free tier instead, reached through DATABASE_URL.
+#
+#   * No workers. Render has no free background worker -- the cheapest is $7/mo.
+#     The publisher, reconciler and drift detector run hourly as scheduled GitHub
+#     Actions instead; see .github/workflows/workers.yml. That is a real trade
+#     (events drain hourly, not in seconds) rather than a workaround, because the
+#     outbox is durable: a delayed publish is delayed, not lost.
+#
+# Deploy: Render dashboard -> New -> Blueprint -> select this repo.
+# Full walkthrough: docs/deploy-free-tier.md
+
+services:
+  - type: web
+    name: ledgerline
+    runtime: python
+    plan: free
+
+    # Create the Neon project in the SAME region (Oregon => AWS us-west-2). A
+    # free web service in Oregon talking to a database in Frankfurt pays the
+    # round trip on every one of the several queries a charge makes.
+    region: oregon
+    branch: main
+
+    # Python is pinned by .python-version (3.13), NOT left to Render's default.
+    # Render defaults new services to 3.14.x, and this project targets 3.13 in CI
+    # and in ruff's target-version. Phase 7 already shipped one bug of exactly
+    # this shape -- a Dockerfile on 3.12 while the suite was green on 3.13 -- and
+    # letting the platform pick the interpreter is how that happens again.
+
+    # Migrations run at BUILD time because Render's preDeployCommand is a paid
+    # feature. The build completes before the new instance is promoted, so
+    # `alembic upgrade head` still finishes before this revision serves anything.
+    #
+    # The consequence worth knowing: DATABASE_URL must exist before the FIRST
+    # deploy, or the build fails. That failure is the good outcome -- the previous
+    # revision keeps serving, and nothing comes up healthy while being wrong.
+    #
+    # alembic/env.py imports app.config, so a plain postgres:// URL is refused
+    # here, at build, rather than at the first query.
+    buildCommand: pip install -r requirements.txt && alembic upgrade head
+
+    # $PORT is supplied by Render (default 10000); binding 0.0.0.0 is required.
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+
+    # /health touches no dependency, so Render's health check never wakes the
+    # database. /ready would -- and a readiness probe on a timer would hold Neon
+    # awake permanently and spend the entire 100 compute-hour monthly budget
+    # doing nothing. The distinction Phase 7 drew between the two endpoints is
+    # what makes the free tier viable here.
+    healthCheckPath: /health
+
+    envVars:
+      - key: APP_ENV
+        value: production
+
+      # Set by hand in the Render dashboard, never committed. Must carry the
+      # +asyncpg prefix: Neon hands out a plain postgres:// URL and the startup
+      # guard in app/config.py refuses it. See docs/deploy-free-tier.md.
+      - key: DATABASE_URL
+        sync: false
+
+      - key: LOG_FORMAT
+        value: json
+
+      # The stock pool (25 + 35 = 60 connections) was sized for Phase 4's
+      # concurrency harness against a local Postgres, not for a 512 MB free
+      # instance against a 0.25 CU Neon compute that offers ~97 connections in
+      # total. Shrunk so the web service cannot corner the database's whole
+      # connection budget while the hourly workers also need some.
+      - key: DB_POOL_SIZE
+        value: "5"
+      - key: DB_MAX_OVERFLOW
+        value: "5"

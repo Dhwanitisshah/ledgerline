@@ -1,0 +1,61 @@
+name: Keep warm (opt-in)
+
+# DISABLED BY DEFAULT. The schedule below is commented out on purpose -- read what
+# it costs before switching it on.
+#
+# The problem it solves: a Render free web service spins down after 15 minutes
+# without traffic and takes about a minute to wake, so the first person to open a
+# cold link waits a minute for a blank tab. On a portfolio link that is the whole
+# first impression.
+#
+# The problem it creates: Render grants a workspace 750 free instance-hours per
+# CALENDAR MONTH and suspends every free web service in the workspace once they
+# are gone. A service kept awake around the clock burns roughly 730 of those 750
+# hours. That is the entire monthly allowance spent on one service, with nothing
+# left for a second one and no margin for a month where anything else runs.
+#
+# So the honest choice is between:
+#
+#   * Leave this off. Accept the ~1 minute cold start, and warm the service by
+#     hand a minute before showing it to anyone:
+#         curl.exe https://<app>.onrender.com/health
+#     Or just trigger this workflow from the Actions tab, which does the same.
+#
+#   * Turn it on, and accept that Ledgerline is now the only free web service this
+#     Render workspace can run for the rest of the month.
+#
+# Whichever you pick, note what this pings: /health, never /ready.
+#
+# /health touches no dependency (Phase 7 built it that way), so keeping Render
+# awake costs nothing on the database side. /ready opens a Postgres connection --
+# pointing a 10-minute timer at it would hold Neon permanently awake and quietly
+# spend the whole 100 compute-hour monthly budget on health checks, which is the
+# one mistake that would take the database down while everything looked fine.
+
+on:
+  # Uncomment to enable. Every 10 minutes, comfortably inside Render's 15-minute
+  # spin-down window.
+  # schedule:
+  #   - cron: "*/10 * * * *"
+
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Ping /health
+        env:
+          # A repository VARIABLE, not a secret -- it is a public URL, and putting
+          # it in secrets only means the logs redact the thing you want to read.
+          BASE_URL: ${{ vars.RENDER_BASE_URL }}
+        run: |
+          if [ -z "$BASE_URL" ]; then
+            echo "::error::Set the RENDER_BASE_URL repository variable (Settings -> Secrets and variables -> Actions -> Variables), e.g. https://ledgerline.onrender.com"
+            exit 1
+          fi
+          # --max-time 90 because a cold start takes about a minute and this
+          # request is frequently the one paying for it.
+          curl -fsS --max-time 90 "$BASE_URL/health" && echo

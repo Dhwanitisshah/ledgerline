@@ -230,6 +230,46 @@ limiting, and tested backups. Each is named in its phase's "what you do not get"
 - pydantic-settings (config from `.env`)
 
 
+## Live deployment
+
+**<https://ledgerline.onrender.com>** — replace with the real URL once Render
+assigns one. `/docs` is the interactive API, `/metrics` the Prometheus exposition.
+
+Running entirely on free tiers, no card anywhere:
+
+| Piece | Where | What it costs |
+| --- | --- | --- |
+| Web service | Render free | $0 — sleeps after 15 min idle |
+| Postgres | Neon free | $0 — 0.5 GB, autosuspends after 5 min |
+| Publisher · reconciler · drift | GitHub Actions, hourly | $0 — unmetered on public repos |
+
+Migrations run on deploy (`alembic upgrade head` in the build), `APP_ENV=production`
+so the fake-processor knobs are refused, and the workers really do run rather than
+being quietly dropped.
+
+**Three seams worth knowing before you click the link**, because they are the price
+of the $0 and this README would rather name them than let you discover them:
+
+- **The first request after 15 idle minutes takes about a minute.** Render spins
+  free services down. Hit `/health` once and wait, then it is fast.
+- **Outbox events drain hourly, not in seconds.** There is no free always-on
+  worker anywhere, so Phase 5b's publisher runs on a schedule. This is safe
+  precisely because of what Phase 5b built: the event was committed in the same
+  transaction as the money, so a delayed publish is delayed, not lost.
+- **The hourly cadence is a budget, not a preference.** Neon allows 100
+  compute-hours a month; hourly costs about 72. Every 30 minutes would exhaust it
+  before the month ended.
+
+This demonstrates **deployed and reachable** — not production-grade infrastructure,
+and it is worth being blunt about the difference. There is still **no
+authentication** on any endpoint, one instance with no redundancy, and backups that
+have never been restore-tested.
+
+Full walkthrough, including the `postgresql+asyncpg://` rewrite that Neon's URL
+needs in two separate places: **[docs/deploy-free-tier.md](docs/deploy-free-tier.md)**.
+For the paid path and the platform comparison that chose it,
+[Phase 7](docs/phase-7-hardening-deploy.md#choosing-the-platform-honestly).
+
 ## Getting started
 
 | | |
@@ -237,7 +277,8 @@ limiting, and tested backups. Each is named in its phase's "what you do not get"
 | **Run it locally** | [docs/running-locally.md](docs/running-locally.md) — Postgres, migrations, the API, and all three background processes |
 | **Run the tests** | [docs/testing.md](docs/testing.md) — why they need a real Postgres, and what the `race` marker means |
 | **Break it on purpose** | [How to break it](#how-to-break-it) above — every preserved bug, with the command that triggers it |
-| **Deploy it** | [Phase 7](docs/phase-7-hardening-deploy.md#choosing-the-platform-honestly) — the platform comparison and the deploy steps |
+| **Deploy it free** | [docs/deploy-free-tier.md](docs/deploy-free-tier.md) — Neon + Render + scheduled workers, $0, no card |
+| **Deploy it paid** | [Phase 7](docs/phase-7-hardening-deploy.md#choosing-the-platform-honestly) — the platform comparison and the Fly.io steps |
 
 ## Notes
 

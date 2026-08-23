@@ -1,0 +1,122 @@
+name: Workers
+
+# Phase 5a's reconciler, Phase 5b's publisher and Phase 6's drift detector, as
+# scheduled jobs rather than always-on machines.
+#
+# They live here because there is no free always-on worker anywhere: Render's
+# cheapest is $7/mo, Koyeb's free instance explicitly cannot run Worker Services,
+# and Fly has had no free tier since 2024. GitHub Actions is free and unmetered on
+# public repositories, so this is the one place the workers can run for nothing.
+#
+# The order below is not alphabetical and is not arbitrary:
+#
+#   1. reconcile -- settles payments stranded in 'processing'. Settling one also
+#                   WRITES a payment.succeeded outbox event (app/reconcile.py
+#                   imports record_payment_succeeded).
+#   2. publisher -- drains the outbox, INCLUDING whatever step 1 just wrote. Run
+#                   these the other way round and every payment the reconciler
+#                   rescues waits a full hour for its event to go out.
+#   3. drift     -- compares our ledger against the processor's books and reports.
+#                   Last, deliberately: it should look at the world after the
+#                   other two have finished moving it, or it reports work in
+#                   progress as a discrepancy.
+
+on:
+  schedule:
+    # Hourly at :17, not :00 -- scheduled workflows are delayed when the whole
+    # platform fires at the top of the hour.
+    #
+    # The cadence is a BUDGET, not a preference. Neon's free tier allows 100
+    # compute-hours per month and suspends the database when they are spent. Each
+    # wake costs the run itself plus Neon's 5-minute autosuspend timer: call it 6
+    # minutes. Hourly is 24 x 6 = 144 min/day, about 72 hours/month, which leaves
+    # headroom for deploys and demo traffic. Every 30 minutes would be ~144
+    # hours/month and the database would suspend itself before the month ended.
+    #
+    # So: if you speed this up, do the arithmetic first.
+    - cron: "17 * * * *"
+
+  # Run a pass by hand from the Actions tab -- useful straight after a deploy, or
+  # after the smoke script leaves two events sitting in the outbox.
+  workflow_dispatch:
+
+# One pass at a time. Two publishers draining the same outbox is safe -- that is
+# what the claim in app/publisher.py exists for -- but it is pointless work, and
+# it wakes Neon twice for what one pass would have done.
+concurrency:
+  group: ledgerline-workers
+  cancel-in-progress: false
+
+jobs:
+  workers:
+    runs-on: ubuntu-latest
+
+    # A hung pass must be a red run rather than a silent one. This is the backstop;
+    # every step below carries its own tighter cap, so a single wedged worker is
+    # named in the log instead of the whole job timing out anonymously.
+    timeout-minutes: 10
+
+    env:
+      # The same value the Render service uses, and it must carry the +asyncpg
+      # prefix for exactly the same reason.
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+      # These operate on production data, so they run under the production config.
+      # That is not cosmetic: it means they also refuse to start if a deliberately
+      # broken strategy path is ever selected here.
+      APP_ENV: production
+      LOG_FORMAT: json
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # One source of truth, shared with Render. Not "3.13" written inline
+          # again, because a version pinned in three places is a version pinned in
+          # none of them.
+          python-version-file: .python-version
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Checked here so a missing or wrong-scheme secret is one clear sentence,
+      # rather than a pydantic ValidationError buried in the first worker's
+      # traceback. Same failure, several minutes earlier and legible.
+      - name: The database URL is present and uses the asyncpg driver
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "::error::DATABASE_URL secret is not set. Add it under Settings -> Secrets and variables -> Actions -> New repository secret."
+            exit 1
+          fi
+          case "$DATABASE_URL" in
+            postgresql+asyncpg://*)
+              echo "DATABASE_URL scheme ok" ;;
+            *)
+              echo "::error::DATABASE_URL must start with postgresql+asyncpg:// -- Neon hands out a plain postgres:// URL and the scheme has to be rewritten. See docs/deploy-free-tier.md."
+              exit 1 ;;
+          esac
+
+      - name: Settle payments stranded in processing
+        timeout-minutes: 3
+        run: python -m app.reconcile --once
+
+      - name: Drain the outbox
+        timeout-minutes: 3
+        run: python -m app.publisher --once
+
+      # Exits 0 even when it finds drift, by design: drift is a thing to read, not
+      # a thing that failed. A red build for a condition this job cannot fix is how
+      # a report ends up ignored or switched off.
+      - name: Report ledger drift
+        timeout-minutes: 3
+        run: python -m app.drift --once
+
+      # Cheap closing summary: --status publishes nothing, it only says what is
+      # left. This is the number worth seeing from the run list without opening
+      # the log -- if pending climbs hour after hour, the publisher is not keeping
+      # up and the outbox is filling.
+      - name: Outbox status after the pass
+        if: always()
+        timeout-minutes: 2
+        run: python -m app.publisher --status
