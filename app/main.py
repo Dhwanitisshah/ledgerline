@@ -21,6 +21,7 @@ from sqlalchemy import text
 from app import metrics
 from app.config import settings
 from app.db import async_session, engine
+from app.docs import register_docs_routes
 from app.middleware import LedgerlineMiddleware
 from app.observability import collect_domain_gauges, configure_logging
 from app.routers import accounts, charges, refunds, transactions, webhooks, withdrawals
@@ -147,6 +148,12 @@ app = FastAPI(
     lifespan=lifespan,
     contact={"name": "Ledgerline", "url": "https://github.com/Dhwanitisshah/ledgerline"},
     license_info={"name": "MIT"},
+    # Built-in docs off; app/docs.py serves the same two URLs instead. They are
+    # the only HTML this API returns and therefore the only responses that need
+    # anything past `default-src 'none'` -- and serving them ourselves is what lets
+    # each page carry a policy computed from its own bytes. See app/docs.py.
+    docs_url=None,
+    redoc_url=None,
 )
 
 # ONE middleware, not four. It was four small BaseHTTPMiddleware classes until
@@ -156,6 +163,10 @@ app = FastAPI(
 # and adds no task groups; the four concerns are still four separate blocks inside
 # it. See app/middleware.py.
 app.add_middleware(LedgerlineMiddleware)
+
+# /docs and /redoc, with a CSP that lets them actually render. Registered after
+# the middleware so their own policy is the one that survives.
+register_docs_routes(app, openapi_url=app.openapi_url or "/openapi.json")
 
 # Off unless configured. This is an API with no browser client, and an allow-list
 # that starts permissive is one nobody ever tightens.

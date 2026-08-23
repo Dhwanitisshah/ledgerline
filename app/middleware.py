@@ -52,6 +52,7 @@ honest signal left at that point.
 
 import logging
 import time
+from collections.abc import Sequence
 
 from starlette.datastructures import MutableHeaders
 from starlette.requests import Request
@@ -98,11 +99,12 @@ UNLIMITED_PATHS = frozenset({"/health", "/ready", "/metrics"})
 #:
 #: * nosniff -- a browser must not decide a JSON error body is really HTML and
 #:   execute it. The one that matters for an API.
-#: * CSP default-src 'none' -- nothing loads, because an API response has no
-#:   legitimate subresources.
 #: * DENY -- no framing, so nothing served from this origin can be clickjacked.
 #: * no-referrer -- URLs here contain payment ids, which should not leak into a
 #:   third party's referrer logs.
+#:
+#: The Content-Security-Policy is not in here because it is the one header that is
+#: not the same on every route; see ``csp_for_path`` below.
 #:
 #: Deliberately absent: Strict-Transport-Security. HSTS is a promise about the whole
 #: origin that outlives this response, and the application does not know whether TLS
@@ -111,8 +113,69 @@ SECURITY_HEADERS: tuple[tuple[str, str], ...] = (
     ("x-content-type-options", "nosniff"),
     ("x-frame-options", "DENY"),
     ("referrer-policy", "no-referrer"),
-    ("content-security-policy", "default-src 'none'"),
 )
+
+CSP_HEADER = "content-security-policy"
+
+#: The policy for an API response: nothing loads, because a JSON body has no
+#: legitimate subresources. This is the default and it applies to every route
+#: except the three below.
+STRICT_CSP = "default-src 'none'"
+
+#: The three routes that are not JSON. Swagger UI and ReDoc are HTML pages made of
+#: a CDN bundle, a CDN stylesheet, a favicon and one inline ``<script>``, and
+#: ``default-src 'none'`` blocks every one of them -- which is exactly what it did:
+#: /docs and /redoc rendered as a blank page with six blocked resources in the
+#: console. The fix is scoped to these paths rather than applied to the origin.
+#:
+#: /openapi.json is JSON and needs nothing relaxed to render; it is here so that
+#: "the documentation" is one set of paths with one policy rather than two paths
+#: with one policy and a third that happens to work by accident.
+DOC_PATHS = frozenset({"/docs", "/redoc", "/openapi.json"})
+
+#: Everything the docs pages legitimately load, and nothing else.
+#:
+#: * jsdelivr for the Swagger and ReDoc bundles and Swagger's stylesheet;
+#: * fastapi.tiangolo.com for the favicon FastAPI points at;
+#: * Google Fonts for ReDoc's two typefaces;
+#: * ``'unsafe-inline'`` for *styles only* -- both bundles style themselves at
+#:   runtime through inline ``style`` attributes, which no hash can cover. Inline
+#:   *script* is not allowed this way: see ``docs_csp``.
+#: * ``blob:`` workers, because ReDoc parses the spec off the main thread.
+_DOC_DIRECTIVES: tuple[tuple[str, str], ...] = (
+    ("default-src", "'none'"),
+    ("style-src", "'self' https://cdn.jsdelivr.net https://fonts.googleapis.com 'unsafe-inline'"),
+    ("img-src", "'self' data: https://cdn.jsdelivr.net https://fastapi.tiangolo.com"),
+    ("font-src", "'self' https://cdn.jsdelivr.net https://fonts.gstatic.com"),
+    ("connect-src", "'self'"),
+    ("worker-src", "'self' blob:"),
+    ("frame-ancestors", "'none'"),
+    ("base-uri", "'none'"),
+    ("form-action", "'none'"),
+)
+
+
+def docs_csp(script_hashes: Sequence[str] = ()) -> str:
+    """The relaxed policy, for the documentation routes only.
+
+    ``script_hashes`` are sha256 hashes of the inline ``<script>`` blocks in the
+    page being served -- see ``app/docs.py``, which computes them from the exact
+    bytes it is about to return. Allowing the inline script by the hash of its own
+    contents rather than by ``'unsafe-inline'`` is the whole point: it permits the
+    one script FastAPI wrote and nothing else, so a reflected string that reached
+    this page still would not execute.
+
+    Called with no hashes for /openapi.json, which has no scripts to allow.
+    """
+    sources = " ".join(["'self'", "https://cdn.jsdelivr.net", *script_hashes])
+    directives = [f"script-src {sources}"]
+    directives.extend(f"{name} {value}" for name, value in _DOC_DIRECTIVES)
+    return "; ".join(directives)
+
+
+def csp_for_path(path: str) -> str:
+    """Strict everywhere; relaxed on the documentation routes and nowhere else."""
+    return docs_csp() if path in DOC_PATHS else STRICT_CSP
 
 
 def route_template(scope: Scope) -> str:
@@ -195,6 +258,11 @@ class LedgerlineMiddleware:
                 for name, value in SECURITY_HEADERS:
                     if name not in headers:
                         headers[name] = value
+                # A route may have set its own policy -- /docs does, because only
+                # the handler knows the hash of the script it just rendered. If it
+                # did, leave it; otherwise the path decides.
+                if CSP_HEADER not in headers:
+                    headers[CSP_HEADER] = csp_for_path(path)
                 for name, value in rate_headers:
                     headers[name] = value
             await send(message)
@@ -265,6 +333,9 @@ class LedgerlineMiddleware:
             "X-RateLimit-Remaining": "0",
         }
         headers.update({name: value for name, value in SECURITY_HEADERS})
+        # A refusal is a JSON body no matter which path asked for it, including
+        # /docs -- so it gets the strict policy rather than the page's.
+        headers[CSP_HEADER] = STRICT_CSP
 
         await JSONResponse(
             status_code=429,

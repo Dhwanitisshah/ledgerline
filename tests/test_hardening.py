@@ -17,7 +17,9 @@ from httpx import ASGITransport, AsyncClient
 
 from app import metrics
 from app.config import settings
-from app.middleware import limiter
+from app.docs import inline_script_hashes
+from app.main import app
+from app.middleware import DOC_PATHS, STRICT_CSP, csp_for_path, limiter
 from app.observability import REQUEST_ID_HEADER
 from tests.conftest import create_account, create_charge, post_charge, refund_charge
 
@@ -190,6 +192,66 @@ async def test_security_headers_are_present(client: AsyncClient) -> None:
     assert response.headers["X-Frame-Options"] == "DENY"
     assert response.headers["Referrer-Policy"] == "no-referrer"
     assert "default-src 'none'" in response.headers["Content-Security-Policy"]
+
+
+async def test_only_the_docs_routes_get_the_relaxed_csp(client: AsyncClient) -> None:
+    """The CSP is relaxed on three paths and strict on everything else.
+
+    ``default-src 'none'`` is right for a JSON API and fatal for Swagger UI, which
+    is a CDN bundle, a CDN stylesheet, a favicon and an inline script -- all four
+    blocked, so /docs and /redoc rendered blank. The relaxation is per route, and
+    the half of that which is easy to get wrong is the second half: loosening the
+    policy for the docs page and quietly loosening it for the payment endpoints
+    too. So this asserts both directions.
+    """
+    for path in DOC_PATHS:
+        response = await client.get(path)
+        assert response.status_code == 200, path
+        policy = response.headers["Content-Security-Policy"]
+        # Relaxed, but only by what the page actually loads: still `'none'` by
+        # default, with the CDN allowed for the bundles.
+        assert "default-src 'none'" in policy, path
+        assert "https://cdn.jsdelivr.net" in policy, path
+
+    # Representative live requests: the operational endpoints, a real resource, a
+    # 404 (no route matched at all) and a 405 (matched, wrong method).
+    for path in ("/health", "/ready", "/metrics", "/accounts", "/no-such-route"):
+        response = await client.get(path)
+        assert response.headers["Content-Security-Policy"] == STRICT_CSP, path
+    assert (await client.post("/health")).headers["Content-Security-Policy"] == STRICT_CSP
+
+    # And exhaustively over the route table, so a route added later that nobody
+    # thought to request here is still covered.
+    for route in app.routes:
+        path = getattr(route, "path", "")
+        if path not in DOC_PATHS:
+            assert csp_for_path(path) == STRICT_CSP, path
+
+
+async def test_the_docs_inline_script_is_allowed_by_its_hash_not_by_unsafe_inline(
+    client: AsyncClient,
+) -> None:
+    """Swagger's inline script runs because of what it contains, not because inline
+    script is permitted.
+
+    ``'unsafe-inline'`` in script-src would have fixed the blank page in one word
+    and given up the only thing the header was buying. The hash is computed from the
+    bytes being served, so it cannot drift out of date with the page and it does not
+    extend to any other inline script.
+    """
+    response = await client.get("/docs")
+    script_src = next(
+        directive.strip()
+        for directive in response.headers["Content-Security-Policy"].split(";")
+        if directive.strip().startswith("script-src")
+    )
+
+    assert "'unsafe-inline'" not in script_src
+
+    hashes = inline_script_hashes(response.content)
+    assert hashes, "the docs page should still have an inline script to allow"
+    for script_hash in hashes:
+        assert script_hash in script_src
 
 
 # --- Liveness, readiness, metrics --------------------------------------------------------

@@ -100,6 +100,31 @@ can span two services — after being truncated and stripped of anything unprint
 That value lands in every log line, and a newline in the middle of one is how a
 single request forges log entries that never happened.
 
+### The one place `default-src 'none'` is wrong
+
+Every response carries `Content-Security-Policy: default-src 'none'`, which for a
+JSON API is exactly right: the body has no legitimate subresources, so nothing is
+allowed to load. It is also exactly wrong for the two HTML pages this service
+serves. Swagger UI is a CDN script bundle, a CDN stylesheet, a favicon and one
+inline `<script>`, and `'none'` blocked all of them — `/docs` and `/redoc` rendered
+as a blank page with six refusals in the console, which looks precisely like an
+application that is down.
+
+The relaxation is **per route, not per origin**: `/docs`, `/redoc` and
+`/openapi.json` get a policy that allows `cdn.jsdelivr.net` and the fonts and
+favicon the pages reference; every other path keeps the strict one. That second
+half is the half worth testing, and it is tested — over live requests *and*
+exhaustively over the route table, so a route added later is covered by a test
+nobody has to remember to update.
+
+The inline script is allowed by the **sha256 of its own contents**, computed in the
+handler from the bytes about to be served (`app/docs.py`). `'unsafe-inline'` would
+have fixed the blank page in one word and given up the only property the header was
+buying; a hardcoded hash would break the page silently on the next FastAPI bump.
+Inline *styles* are still allowed wholesale, because both bundles style themselves
+through inline `style` attributes, which no hash can cover — a stated limit rather
+than an oversight.
+
 ### Rate limiting, and what it does not do
 
 `/webhooks` is a public endpoint with no signature verification (carried forward
@@ -330,7 +355,8 @@ worse ending than one that says where it stopped.
 - A deliberately-broken strategy path aborts startup instead of serving wrong answers
 - Every response carries `X-Request-ID`; a 500 carries an id and nothing else — no
   traceback, no exception message, no file paths
-- Security headers on every response; liveness and readiness are separate endpoints
+- Security headers on every response, with the CSP relaxed on the three docs
+  routes and nowhere else; liveness and readiness are separate endpoints
 - `/metrics` serves valid Prometheus text with `ledgerline_ledger_imbalance_minor_units`
   at 0, labelled by route template and never by path
 - Rate limiting refuses with `Retry-After`, and never refuses a health check
